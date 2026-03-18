@@ -1645,9 +1645,18 @@ class GoogleDriveManager {
         try {
             await this.#ensureToken();
             // Get the actual root folder ID
-            const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/root?fields=id,name`);
-            if (!resp.ok) throw new Error('Failed to access Drive');
-            const rootInfo = await resp.json();
+			const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/root?fields=id,name`);
+			if (!resp.ok) {
+			    const errorText = await resp.text();
+			    console.error('=== GOOGLE DRIVE ROOT 403 DEBUG ===', {
+			        status: resp.status,
+			        statusText: resp.statusText,
+			        body: errorText,
+			        url: resp.url
+			    });
+			    throw new Error(`Root failed: ${resp.status} — ${errorText}`);
+			}
+			const rootInfo = await resp.json();
             const rootHandle = this.#makeHandle(rootInfo.id, 'My Drive', 'directory');
             this.state.currentDirHandle = rootHandle;
             await this.saveFolderHandle(rootHandle);
