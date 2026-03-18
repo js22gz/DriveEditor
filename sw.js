@@ -1,4 +1,4 @@
-const CACHE_NAME = 'Editor-v2';
+const CACHE_NAME = 'Drive-Editor';
 const urlsToCache = [
   './',
   'index.html',
