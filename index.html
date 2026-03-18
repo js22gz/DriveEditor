@@ -471,7 +471,7 @@ header:fullscreen { display: none; }
           <div id="title-area">
               <span id="title-label">EDITOR</span>
           </div>
-          <button id="local-folder-btn" title="Switch to local File System Access API">Local Folder</button>
+          <button id="local-folder-btn" title="Switch to Local Folder">Local Folder</button>
       </header>
       <main>
         <aside id="sidebar">
@@ -3477,6 +3477,14 @@ class EditorApp {
         this.ui.fs = fs;
         this.extensions.fs = fs;
         this.#wireBackend(fs);
+        this.#updateBackendBtn();
+    }
+    #updateBackendBtn() {
+        const btn = document.getElementById('local-folder-btn');
+        if (!btn) return;
+        const isLocal = this.fs === this.localFs;
+        btn.textContent = isLocal ? 'Google Drive' : 'Local Folder';
+        btn.title = isLocal ? 'Switch to Google Drive' : 'Switch to Local Folder';
     }
     /** Switches to local File System Access API backend */
     async switchToLocal() {
@@ -3520,13 +3528,20 @@ if ('serviceWorker' in navigator) {
 window.onload = async () => {
     window.editorApp = new EditorApp();
     await window.editorApp.init();
-    // Wire "Switch to Local Folder" button
+    // Wire backend‑toggle button (Local Folder ↔ Google Drive)
     const localBtn = document.getElementById('local-folder-btn');
     if (localBtn) {
         if (!('showDirectoryPicker' in window)) {
             localBtn.style.display = 'none';
         }
-        localBtn.addEventListener('click', () => window.editorApp.switchToLocal());
+        localBtn.addEventListener('click', () => {
+            const app = window.editorApp;
+            if (app.fs === app.localFs) {
+                app.switchToDrive();
+            } else {
+                app.switchToLocal();
+            }
+        });
     }
 };
 </script>
