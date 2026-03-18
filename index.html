@@ -1,3 +1,4 @@
+<!-- Refactored for Google Drive – Mobile-first PWA (March 2026) -->
 <script>
 	window.WELCOME = `EDITOR
 	══════
@@ -103,6 +104,7 @@ window.LEGEND = `<!--
     <title>EDITOR</title>
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#18181b">
+    <script src="https://accounts.google.com/gsi/client" async></script>
 <style>
 /* ────────────────────────────────────────────────────────
    1. VARIABLES & THEME
@@ -454,6 +456,14 @@ header:fullscreen { display: none; }
   .tree-vline, .tree-tee, .tree-elbow { top: -10px; }
   .tree-vline, .tree-tee { bottom: -10px; }
 }
+#local-folder-btn {
+  position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+  background: none; border: 1px solid var(--border-color); color: var(--text-secondary);
+  font-size: 11px; padding: 4px 10px; border-radius: 3px; cursor: pointer;
+  font-family: ui-monospace, monospace; z-index: 10;
+}
+#local-folder-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+@media (max-width: 768px) { #local-folder-btn { display: none; } }
 </style>
 </head>
 <body>
@@ -461,12 +471,13 @@ header:fullscreen { display: none; }
           <div id="title-area">
               <span id="title-label">EDITOR</span>
           </div>
+          <button id="local-folder-btn" title="Switch to local File System Access API">Local Folder</button>
       </header>
       <main>
         <aside id="sidebar">
             <div id="sidebar-header">
                 <div id="sidebar-root-row" class="sidebar-header-row" title="Click to open folder">
-                    <span><span id="root-dir-name">Click to open folder</span></span>
+                    <span><span id="root-dir-name">Connect Google Account</span></span>
                     <span id="sidebar-header-actions"></span>
                 </div>
             </div>
@@ -1190,6 +1201,866 @@ async renameItem() {
     async isSameEntry(h1, h2) {
         if (!h1 || !h2) return false;
         return h1.isSameEntry(h2);
+    }
+}
+// ────────────────────────────────────────────────────────
+// GoogleDriveManager – Google Drive REST v3 backend
+// (replaces FileSystemManager for Drive-first operation)
+// ────────────────────────────────────────────────────────
+class GoogleDriveManager {
+    #INVALID_CHARS = /[<>:"|?*\x00-\x1F]/;
+    #saveInProgress = false;
+    #restoring = false;
+    #restoreStartedAt = 0;
+    #accessToken = null;
+    #tokenClient = null;
+    #tokenExpiresAt = 0;
+    #rootFolderId = null;
+    // Replace with your own Google Cloud OAuth 2.0 Client ID
+    static CLIENT_ID = 'YOUR_CLIENT_ID.apps.googleusercontent.com';
+    static SCOPES = 'https://www.googleapis.com/auth/drive.file';
+    static DRIVE_API = 'https://www.googleapis.com/drive/v3';
+    static UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
+    static FOLDER_MIME = 'application/vnd.google-apps.folder';
+    /** @param {ReactiveState} state @param {PathUtils} pathUtils */
+    constructor(state, pathUtils) {
+        this.state = state;
+        this.pathUtils = pathUtils;
+        this.db = null;
+        /** @type {TreeManager} */ this.tree = null;
+        /** @type {TabManager} */ this.tabs = null;
+        /** @type {UIManager} */ this.ui = null;
+        this.scheduleSave = (() => {
+            let timer;
+            return () => {
+                clearTimeout(timer);
+                timer = setTimeout(() => {
+                    if (this.#saveInProgress || !this.state.currentTabId) return;
+                    const tab = this.state.getTab(this.state.currentTabId);
+                    if (tab?.dirty) this.saveTab(tab);
+                }, 750);
+            };
+        })();
+    }
+
+    // ── Drive API helpers ─────────────────────────────────
+    /** Ensures a valid access token, refreshing silently if expired */
+    async #ensureToken() {
+        if (this.#accessToken && Date.now() < this.#tokenExpiresAt - 60000) {
+            return this.#accessToken;
+        }
+        return new Promise((resolve, reject) => {
+            if (!this.#tokenClient) {
+                this.#initTokenClient();
+            }
+            this.#tokenClient.callback = (resp) => {
+                if (resp.error) {
+                    reject(new Error(resp.error));
+                    return;
+                }
+                this.#accessToken = resp.access_token;
+                this.#tokenExpiresAt = Date.now() + (resp.expires_in * 1000);
+                this.#saveTokenToDB();
+                resolve(this.#accessToken);
+            };
+            this.#tokenClient.requestAccessToken({ prompt: this.#accessToken ? '' : 'consent' });
+        });
+    }
+
+    #initTokenClient() {
+        if (typeof google === 'undefined' || !google.accounts?.oauth2) {
+            throw new Error('Google Identity Services not loaded');
+        }
+        if (GoogleDriveManager.CLIENT_ID.includes('YOUR_CLIENT_ID')) {
+            throw new Error('Replace GoogleDriveManager.CLIENT_ID with your OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials');
+        }
+        this.#tokenClient = google.accounts.oauth2.initTokenClient({
+            client_id: GoogleDriveManager.CLIENT_ID,
+            scope: GoogleDriveManager.SCOPES,
+            callback: () => {},
+        });
+    }
+
+    /** Drive API fetch wrapper with auto-retry on 401 */
+    async #driveRequest(url, options = {}) {
+        const token = await this.#ensureToken();
+        const headers = { 'Authorization': `Bearer ${token}`, ...(options.headers || {}) };
+        let resp = await fetch(url, { ...options, headers });
+        if (resp.status === 401) {
+            this.#accessToken = null;
+            const newToken = await this.#ensureToken();
+            headers['Authorization'] = `Bearer ${newToken}`;
+            resp = await fetch(url, { ...options, headers });
+        }
+        return resp;
+    }
+
+    #formatError(action, e) {
+        if (e.message?.includes('permission') || e.message?.includes('403')) return `${action} failed: permission denied – reconnect Google account`;
+        if (e.message?.includes('quota') || e.message?.includes('429')) return `${action} failed: rate limit exceeded, try again`;
+        if (e.message?.includes('404') || e.message?.includes('not found')) return `${action} failed: file/folder not found`;
+        return `${action} failed: ${e.message || e}`;
+    }
+
+    /** Creates a fake handle object for Drive entries – Drive API equivalent of FileSystemHandle */
+    #makeHandle(id, name, kind) {
+        const mgr = this;
+        const handle = { id, name, kind };
+        if (kind === 'directory') {
+            handle.getDirectoryHandle = async (childName) => {
+                return mgr._findChild(id, childName, 'directory');
+            };
+            handle.getFileHandle = async (childName, opts) => {
+                return mgr._findChild(id, childName, 'file', opts);
+            };
+        }
+        if (kind === 'file') {
+            handle.getFile = async () => {
+                return mgr._readFile(id, name);
+            };
+        }
+        handle.isSameEntry = (other) => other?.id === id;
+        return handle;
+    }
+
+    /** Internal: finds a child entry in a Drive folder by name and kind (used by fake handles) */
+    async _findChild(parentId, childName, kind, opts) {
+        const mimeFilter = kind === 'directory'
+            ? `and mimeType='${GoogleDriveManager.FOLDER_MIME}'`
+            : `and mimeType!='${GoogleDriveManager.FOLDER_MIME}'`;
+        const q = encodeURIComponent(`'${parentId}' in parents and name='${childName.replace(/'/g, "\\'")}' ${mimeFilter} and trashed=false`);
+        const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files?q=${q}&fields=files(id,name)&pageSize=1`);
+        if (!resp.ok) throw new DOMException('Not found', 'NotFoundError');
+        const data = await resp.json();
+        if (!data.files?.length) {
+            if (kind === 'file' && opts?.create) {
+                return await this.#createDriveFile(childName, parentId, '');
+            }
+            throw new DOMException('Not found', 'NotFoundError');
+        }
+        return this.#makeHandle(data.files[0].id, data.files[0].name, kind);
+    }
+
+    /** Internal: reads file content from Drive (used by fake handles) */
+    async _readFile(fileId, name) {
+        const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${fileId}?alt=media`);
+        if (!resp.ok) throw new Error(`Read failed: ${resp.status}`);
+        const text = await resp.text();
+        return { text: () => Promise.resolve(text), name };
+    }
+
+    // ── DB & persistence ───────────────────────────────────
+    /** Drive API equivalent of original FSA method – initializes IndexedDB */
+    async initDB() {
+        if (this.db) return;
+        return new Promise(resolve => {
+            const req = indexedDB.open('FileEditor', 2);
+            req.onupgradeneeded = e => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('handles')) db.createObjectStore('handles');
+                if (!db.objectStoreNames.contains('extensions')) db.createObjectStore('extensions');
+            };
+            req.onsuccess = e => { this.db = e.target.result; resolve(); };
+            req.onerror = () => resolve();
+        });
+    }
+
+    /** Drive API equivalent of original FSA method – always returns 'granted' when token is valid */
+    async queryPermission(handle) {
+        if (!handle) return 'denied';
+        if (this.#accessToken && Date.now() < this.#tokenExpiresAt - 60000) return 'granted';
+        try {
+            await this.#ensureToken();
+            return 'granted';
+        } catch { return 'denied'; }
+    }
+
+    /** Drive API equivalent of original FSA method – saves root folder ID + token to IndexedDB */
+    async saveFolderHandle(handle) {
+        await this.initDB();
+        const tx = this.db.transaction('handles', 'readwrite');
+        tx.objectStore('handles').put({ id: handle.id, name: handle.name, kind: 'directory' }, 'main');
+    }
+
+    async #saveTokenToDB() {
+        await this.initDB();
+        const tx = this.db.transaction('handles', 'readwrite');
+        tx.objectStore('handles').put({
+            token: this.#accessToken,
+            expiresAt: this.#tokenExpiresAt,
+        }, 'driveToken');
+    }
+
+    async #loadTokenFromDB() {
+        await this.initDB();
+        return new Promise(resolve => {
+            const tx = this.db.transaction('handles');
+            const req = tx.objectStore('handles').get('driveToken');
+            req.onsuccess = () => {
+                const data = req.result;
+                if (data?.token && data.expiresAt > Date.now() + 60000) {
+                    this.#accessToken = data.token;
+                    this.#tokenExpiresAt = data.expiresAt;
+                }
+                resolve();
+            };
+            req.onerror = () => resolve();
+        });
+    }
+
+    /** Drive API equivalent of original FSA method – loads saved Drive root folder */
+    async loadSavedFolder() {
+        await this.initDB();
+        await this.#loadTokenFromDB();
+        return new Promise(resolve => {
+            const tx = this.db.transaction('handles');
+            const req = tx.objectStore('handles').get('main');
+            req.onsuccess = async () => {
+                const data = req.result;
+                if (!data?.id) return resolve({ status: 'none' });
+                const handle = this.#makeHandle(data.id, data.name || 'My Drive', 'directory');
+                if (this.#accessToken) {
+                    try {
+                        const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/about?fields=user`, {});
+                        if (resp.ok) return resolve({ status: 'granted', handle });
+                    } catch {}
+                }
+                resolve({ status: 'needs-auth', handle });
+            };
+            req.onerror = () => resolve({ status: 'none' });
+        });
+    }
+
+    /** Drive API equivalent of original FSA method – clears saved Drive connection */
+    async clearSavedFolder() {
+        if (this.db) {
+            const tx = this.db.transaction('handles', 'readwrite');
+            tx.objectStore('handles').delete('main');
+            tx.objectStore('handles').delete('driveToken');
+        }
+        this.#accessToken = null;
+        this.#tokenExpiresAt = 0;
+        this.#rootFolderId = null;
+        this.state.currentDirHandle = null;
+        this.state.activeDirectoryPath = null;
+        this.state.expandedFolders.clear();
+        localStorage.removeItem('expandedFolders');
+        localStorage.removeItem('openTabs');
+        this.tree.clear();
+        this.tree.updateHeader();
+    }
+
+    // ── Tree & lazy loading ────────────────────────────────
+    /** Drive API equivalent of original FSA method – lists children of a Drive folder via files.list */
+    async loadChildren(dirNode) {
+        if (dirNode.kind !== 'directory' || dirNode.childrenLoaded) return;
+        dirNode.children = [];
+        try {
+            const folderId = dirNode.handle.id;
+            const q = encodeURIComponent(`'${folderId}' in parents and trashed=false`);
+            const fields = encodeURIComponent('files(id,name,mimeType)');
+            let pageToken = '';
+            const allEntries = [];
+            do {
+                const url = `${GoogleDriveManager.DRIVE_API}/files?q=${q}&fields=nextPageToken,${fields}&pageSize=1000${pageToken ? '&pageToken=' + pageToken : ''}`;
+                const resp = await this.#driveRequest(url);
+                if (!resp.ok) throw new Error(`List failed: ${resp.status}`);
+                const data = await resp.json();
+                for (const f of (data.files || [])) {
+                    if (f.name.startsWith('.') || f.name === 'node_modules' || f.name === '__pycache__') continue;
+                    const kind = f.mimeType === GoogleDriveManager.FOLDER_MIME ? 'directory' : 'file';
+                    allEntries.push({ name: f.name, id: f.id, kind });
+                }
+                pageToken = data.nextPageToken || '';
+            } while (pageToken);
+
+            allEntries.sort((a, b) =>
+                (a.kind !== b.kind ? (a.kind === 'directory' ? -1 : 1) : a.name.localeCompare(b.name, undefined, { numeric: true }))
+            );
+
+            for (const entry of allEntries) {
+                const path = dirNode.path === '/' ? entry.name : `${dirNode.path}/${entry.name}`;
+                const handle = this.#makeHandle(entry.id, entry.name, entry.kind);
+                const node = entry.kind === 'directory'
+                    ? { name: entry.name, kind: 'directory', handle, path, children: [], childrenLoaded: false }
+                    : { name: entry.name, kind: 'file', handle, path };
+                this.tree.registerNode(path, node);
+                dirNode.children.push(node);
+            }
+        } catch (e) { console.warn('loadChildren failed', e); }
+        dirNode.childrenLoaded = true;
+    }
+
+    /** Drive API equivalent of original FSA method – builds file tree from Drive root */
+    async build(rootHandle) {
+        this.tree.clear();
+        this.#rootFolderId = rootHandle.id;
+        const root = {
+            name: rootHandle.name,
+            kind: 'directory',
+            handle: rootHandle,
+            path: '/',
+            children: [],
+            childrenLoaded: false
+        };
+        this.tree.registerNode('/', root);
+        this.tree.fileTree = root;
+        await this.loadChildren(root);
+        return root;
+    }
+
+    /** Drive API equivalent of original FSA method – rebuilds tree preserving expanded state */
+    async mutateAndRebuild() {
+        if (!this.state.currentDirHandle) return;
+        const perm = await this.queryPermission(this.state.currentDirHandle);
+        if (perm !== 'granted') {
+            try {
+                await this.#ensureToken();
+            } catch {
+                this.ui.showToast('Reconnect Google account to grant access', 4000);
+                return;
+            }
+        }
+        if (this._rebuildInFlight) {
+            this._rebuildQueued = true;
+            return;
+        }
+        this._rebuildInFlight = true;
+        try {
+            do {
+                this._rebuildQueued = false;
+                const previouslyExpanded = new Set(this.state.expandedFolders);
+                await this.build(this.state.currentDirHandle);
+                for (const path of [...previouslyExpanded].sort((a, b) => a.split('/').length - b.split('/').length)) {
+                    const node = this.tree.getNode(path);
+                    if (node?.kind === 'directory') {
+                        await this.loadChildren(node);
+                        this.state.expandedFolders.add(path);
+                    }
+                }
+                this.tree.render();
+                this.tree.updateHeader();
+            } while (this._rebuildQueued);
+        } finally {
+            this._rebuildInFlight = false;
+        }
+    }
+
+    // ── Expanded tabs persistence ──────────────────────────
+    /** Drive API equivalent of original FSA method */
+    loadExpandedState() {
+        try {
+            const saved = localStorage.getItem('expandedFolders');
+            if (saved) this.state.expandedFolders = new Set(JSON.parse(saved));
+        } catch {}
+    }
+    /** Drive API equivalent of original FSA method */
+    saveExpandedState() {
+        try { localStorage.setItem('expandedFolders', JSON.stringify([...this.state.expandedFolders])); } catch {}
+    }
+    /** Drive API equivalent of original FSA method */
+    saveOpenTabs(currentId) {
+        try {
+            const data = this.state.tabs
+                .filter(t => t.path)
+                .map(t => ({ path: t.path, name: t.name, type: t.type, active: t.id === currentId, driveId: t.handle?.id }));
+            if (data.length || this.state.currentDirHandle) {
+                localStorage.setItem('openTabs', JSON.stringify(data));
+            }
+        } catch {}
+    }
+    /** Drive API equivalent of original FSA method */
+    loadOpenTabs() {
+        try {
+            const saved = localStorage.getItem('openTabs');
+            return saved ? JSON.parse(saved) : [];
+        } catch { return []; }
+    }
+
+    // ── Session restore ────────────────────────────────────
+    /** Drive API equivalent of original FSA method – restores Drive session from IndexedDB */
+    async restoreSession() {
+        if (this.#restoring && Date.now() - this.#restoreStartedAt < 15000) return;
+        this.#restoring = true;
+        this.#restoreStartedAt = Date.now();
+        try {
+            this.loadExpandedState();
+            const saved = await this.loadSavedFolder();
+            if (saved.status === 'granted') {
+                this.state.currentDirHandle = saved.handle;
+                await this.build(saved.handle);
+                await this.#expandSavedFolders();
+                this.tree.render();
+                this.tree.updateHeader();
+                const restored = await this.tabs.restoreOpenTabs(saved.handle);
+                if (restored) this.ui.showToast(`Restored ${restored} tab${restored > 1 ? 's' : ''}`);
+            } else if (saved.status === 'needs-auth') {
+                this.#handlePendingAuth(saved.handle);
+                return;
+            }
+            if (!this.state.tabs.length) {
+                await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
+            }
+        } finally {
+            this.#restoring = false;
+        }
+    }
+    async #expandSavedFolders() {
+        for (const path of [...this.state.expandedFolders].sort((a, b) => a.split('/').length - b.split('/').length)) {
+            const node = this.tree.getNode(path);
+            if (node?.kind === 'directory') await this.loadChildren(node);
+        }
+    }
+    #handlePendingAuth(handle) {
+        const pendingTabs = this.loadOpenTabs();
+        this.ui.showActionToast('Tap to reconnect Google Account', async () => {
+            try {
+                await this.#ensureToken();
+                this.state.currentDirHandle = handle;
+                await this.build(handle);
+                this.loadExpandedState();
+                await this.#expandSavedFolders();
+                this.tree.render();
+                this.tree.updateHeader();
+                const welcomeIdx = this.state.tabs.findIndex(t => t.type === 'welcome');
+                if (welcomeIdx !== -1) {
+                    this.state.tabs[welcomeIdx].element.remove();
+                    this.state.tabs.splice(welcomeIdx, 1);
+                }
+                const restored = await this.tabs.restoreOpenTabs(handle, pendingTabs);
+                if (restored) this.ui.showToast(`Restored ${restored} tab${restored > 1 ? 's' : ''}`);
+                else if (!this.state.tabs.length) {
+                    await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
+                }
+                this.ui.showToast('Google Drive access restored ✓');
+            } catch {
+                this.ui.showToast('Failed to restore access');
+            }
+        }, 15000);
+    }
+
+    // ── Connect to Drive (equivalent of openFolder) ───────
+    /** Drive API equivalent of original FSA method – connects Google account and sets root to My Drive */
+    async openFolder() {
+        try {
+            await this.#ensureToken();
+            // Get the actual root folder ID
+            const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/root?fields=id,name`);
+            if (!resp.ok) throw new Error('Failed to access Drive');
+            const rootInfo = await resp.json();
+            const rootHandle = this.#makeHandle(rootInfo.id, 'My Drive', 'directory');
+            this.state.currentDirHandle = rootHandle;
+            await this.saveFolderHandle(rootHandle);
+            this.state.expandedFolders.clear();
+            this.state.activeDirectoryPath = null;
+            await this.build(rootHandle);
+            this.tree.render();
+            this.tree.updateHeader();
+            this.ui.showToast('Google Drive connected ✓');
+        } catch (e) {
+            if (e.message !== 'popup_closed_by_user') {
+                this.ui.showToast('Google Drive connection cancelled or failed');
+            }
+        }
+    }
+
+    /** Drive API equivalent of original FSA method – not applicable for Drive, shows toast */
+    async openFile() {
+        this.ui.showToast('Use the file tree to open files from Google Drive');
+    }
+
+    /** Drive API equivalent of original FSA method – reads file content from Drive via files.get with alt=media */
+    async openFileFromNode(node) {
+        try {
+            const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${node.handle.id}?alt=media`);
+            if (!resp.ok) throw new Error(`Read failed: ${resp.status}`);
+            const content = await resp.text();
+            await this.tabs.createNewTab(node.handle, node.name, content, node.path);
+            if (this.ui.isMobile && !this.ui.sidebarEl.classList.contains('hidden')) {
+                this.ui.toggleSidebar();
+            }
+        } catch (e) {
+            this.ui.showToast(e.message.includes('permission') || e.message.includes('403')
+                ? 'Reconnect Google account to grant access'
+                : 'File too large or unreadable as text');
+        }
+    }
+
+    /** Drive API equivalent of original FSA method – opens Drive file in browser via webViewLink */
+    async openInBrowser(node) {
+        try {
+            const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${node.handle.id}?fields=webViewLink`);
+            if (!resp.ok) throw new Error('Failed to get link');
+            const data = await resp.json();
+            if (data.webViewLink) {
+                window.open(data.webViewLink, '_blank');
+            } else {
+                // Fallback: download and open as blob
+                const dlResp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${node.handle.id}?alt=media`);
+                const blob = await dlResp.blob();
+                const url = URL.createObjectURL(blob);
+                window.open(url, '_blank');
+                setTimeout(() => URL.revokeObjectURL(url), 60_000);
+            }
+        } catch (e) {
+            this.ui.showToast('Failed to open file in browser');
+        }
+    }
+
+    // ── Target directory for new items ─────────────────────
+    /** Drive API equivalent of original FSA method – resolves target folder ID for new items */
+    async #getTargetDir() {
+        const targetPath = this.ui.contextMenuTarget?.kind === 'directory'
+            ? this.ui.contextMenuTarget.path
+            : (this.state.activeDirectoryPath || '');
+        if (!targetPath || targetPath === '/') {
+            return { dirId: this.#rootFolderId, targetPath: '' };
+        }
+        const node = this.tree.getNode(targetPath);
+        if (!node) return { dirId: this.#rootFolderId, targetPath: '' };
+        return { dirId: node.handle.id, targetPath };
+    }
+
+    // ── New file/folder ────────────────────────────────────
+    /** Drive API equivalent of original FSA method – creates new file or folder in Drive */
+    async #newItem(kind) {
+        if (!this.state.currentDirHandle) return this.ui.showToast('Connect Google Account first');
+        const isFile = kind === 'file';
+        const activePath = this.state.activeDirectoryPath || '';
+        const rootName = this.state.currentDirHandle.name;
+        const displayPath = '/' + rootName + (activePath ? '/' + activePath : '') + '/';
+        const name = await this.ui.showDialog({ promptTitle: isFile ? 'New file name:' : 'New folder name:', subtitle: displayPath });
+        if (!name?.trim()) return;
+        const trimmed = name.trim();
+        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
+            return this.ui.showToast(isFile ? 'Invalid filename' : 'Invalid folder name');
+        const { dirId, targetPath } = await this.#getTargetDir();
+        try {
+            if (isFile) {
+                const handle = await this.#createDriveFile(trimmed, dirId, '');
+                if (targetPath) {
+                    this.state.expandedFolders.add(targetPath);
+                    this.saveExpandedState();
+                }
+                await this.mutateAndRebuild();
+                await this.tabs.createNewTab(handle, trimmed, '', targetPath ? `${targetPath}/${trimmed}` : trimmed);
+            } else {
+                await this.#createDriveFolder(trimmed, dirId);
+                if (targetPath) {
+                    this.state.expandedFolders.add(targetPath);
+                    this.saveExpandedState();
+                }
+                await this.mutateAndRebuild();
+                this.ui.showToast('Folder created');
+            }
+        } catch (e) {
+            this.ui.showToast(this.#formatError(isFile ? 'Create file' : 'Create folder', e));
+        }
+        this.ui.closeContextMenu();
+    }
+
+    /** Creates a file in Drive – Drive API equivalent of getFileHandle(name, {create:true}) + write */
+    async #createDriveFile(name, parentId, content = '') {
+        const metadata = { name, parents: [parentId] };
+        const boundary = '---drive-boundary-' + Date.now();
+        const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n--${boundary}\r\nContent-Type: text/plain\r\n\r\n${content}\r\n--${boundary}--`;
+        const resp = await this.#driveRequest(`${GoogleDriveManager.UPLOAD_API}/files?uploadType=multipart&fields=id,name`, {
+            method: 'POST',
+            headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+            body,
+        });
+        if (!resp.ok) throw new Error(`Create file failed: ${resp.status}`);
+        const data = await resp.json();
+        return this.#makeHandle(data.id, data.name, 'file');
+    }
+
+    /** Creates a folder in Drive – Drive API equivalent of getDirectoryHandle(name, {create:true}) */
+    async #createDriveFolder(name, parentId) {
+        const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, mimeType: GoogleDriveManager.FOLDER_MIME, parents: [parentId] }),
+        });
+        if (!resp.ok) throw new Error(`Create folder failed: ${resp.status}`);
+        const data = await resp.json();
+        return this.#makeHandle(data.id, data.name, 'directory');
+    }
+
+    /** Drive API equivalent of original FSA method */
+    async newFile() { return this.#newItem('file'); }
+    /** Drive API equivalent of original FSA method */
+    async newFolder() { return this.#newItem('folder'); }
+
+    /** Drive API equivalent of original FSA method – creates untitled file in Drive root */
+    async createUntitledFile() {
+        if (!this.state.currentDirHandle) return null;
+        let name = 'new.txt';
+        let counter = 0;
+        // Check for existing files with the same name
+        const q = encodeURIComponent(`'${this.#rootFolderId}' in parents and trashed=false`);
+        const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files?q=${q}&fields=files(name)&pageSize=1000`);
+        const existingNames = new Set();
+        if (resp.ok) {
+            const data = await resp.json();
+            for (const f of (data.files || [])) existingNames.add(f.name);
+        }
+        while (existingNames.has(name)) {
+            counter++;
+            name = `new_${counter}.txt`;
+        }
+        const handle = await this.#createDriveFile(name, this.#rootFolderId, '');
+        await this.mutateAndRebuild();
+        return this.tabs.createNewTab(handle, name, '', name);
+    }
+
+    // ── Save ───────────────────────────────────────────────
+    /** Drive API equivalent of original FSA method – updates file content in Drive via multipart PATCH */
+    async saveTab(tab) {
+        if (!tab?.handle || !tab.dirty) return;
+        try {
+            const content = (this.state.currentTabId === tab.id && tab.type !== 'extension')
+                ? this.ui.textarea.value
+                : tab.content;
+            await this.#updateDriveFile(tab.handle.id, content);
+            tab.content = content;
+            tab.dirty = false;
+            if (tab.element) tab.element.querySelector('.dirty-indicator').style.visibility = 'hidden';
+            this.ui.updateEditorStatus(tab);
+            this.ui.showToast('Saved', 1200);
+        } catch (err) {
+            this.ui.showToast(err.message.includes('403') ? 'Reconnect Google account' : 'Save failed');
+        }
+    }
+
+    /** Updates file content in Drive – Drive API equivalent of createWritable + write + close */
+    async #updateDriveFile(fileId, content) {
+        const boundary = '---drive-boundary-' + Date.now();
+        const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{}\r\n--${boundary}\r\nContent-Type: text/plain\r\n\r\n${content}\r\n--${boundary}--`;
+        const resp = await this.#driveRequest(`${GoogleDriveManager.UPLOAD_API}/files/${fileId}?uploadType=multipart`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+            body,
+        });
+        if (!resp.ok) throw new Error(`Save failed: ${resp.status}`);
+    }
+
+    /** Drive API equivalent of original FSA method */
+    saveCurrentFile() {
+        const tab = this.state.getActiveTab();
+        if (tab) this.saveTab(tab);
+    }
+    /** Drive API equivalent of original FSA method */
+    async flushSave() {
+        if (this.#saveInProgress) return;
+        this.#saveInProgress = true;
+        try {
+            await Promise.allSettled(this.state.tabs.filter(t => t.dirty).map(t => this.saveTab(t)));
+        } finally {
+            this.#saveInProgress = false;
+        }
+    }
+
+    // ── Delete ─────────────────────────────────────────────
+    /** Drive API equivalent of original FSA method – deletes file via Drive files.delete */
+    async deleteFile() {
+        const target = this.ui.contextMenuTarget;
+        if (!target || target.kind !== 'file') return;
+        if (!await this.ui.showDialog({ isConfirm: true, confirmMessage: `Delete "${target.name}"?`, danger: true })) {
+            this.ui.closeContextMenu(); return;
+        }
+        try {
+            for (const tab of this.state.tabs) {
+                if (tab.handle && await this.isSameEntry(tab.handle, target.handle)) {
+                    await this.tabs.closeTab(tab.id);
+                    break;
+                }
+            }
+            const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${target.handle.id}`, { method: 'DELETE' });
+            if (!resp.ok && resp.status !== 204) throw new Error(`Delete failed: ${resp.status}`);
+            await this.mutateAndRebuild();
+            this.ui.showToast('File deleted');
+        } catch {
+            this.ui.showToast('Delete failed');
+        }
+        this.ui.closeContextMenu();
+    }
+
+    /** Drive API equivalent of original FSA method – deletes folder via Drive files.delete */
+    async deleteFolder() {
+        const target = this.ui.contextMenuTarget;
+        if (!target || target.kind !== 'directory') return;
+        const isNonEmpty = target.children?.length > 0;
+        const confirmed = isNonEmpty
+            ? (await this.ui.showDialog({ promptTitle: `Type "remove" to delete non-empty folder "${target.name}":` }) || '').trim().toLowerCase() === 'remove'
+            : await this.ui.showDialog({ isConfirm: true, confirmMessage: `Delete folder "${target.name}"?`, danger: true });
+        if (!confirmed) { this.ui.closeContextMenu(); return; }
+        try {
+            const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${target.handle.id}`, { method: 'DELETE' });
+            if (!resp.ok && resp.status !== 204) throw new Error(`Delete failed: ${resp.status}`);
+            this.state.expandedFolders.delete(target.path);
+            this.saveExpandedState();
+            await this.mutateAndRebuild();
+            this.ui.showToast('Folder deleted');
+        } catch {
+            this.ui.showToast('Delete failed');
+        }
+        this.ui.closeContextMenu();
+    }
+
+    // ── Rename ─────────────────────────────────────────────
+    /** Drive API equivalent of original FSA method – renames file/folder via Drive files.update */
+    async renameItem() {
+        const target = this.ui.contextMenuTarget;
+        if (!target) return;
+        const newName = await this.ui.showDialog({
+            promptTitle: `Rename ${target.kind}:`,
+            defaultValue: target.name
+        });
+        if (!newName?.trim() || newName === target.name) { this.ui.closeContextMenu(); return; }
+        const trimmed = newName.trim();
+        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed)) {
+            this.ui.showToast('Invalid name'); this.ui.closeContextMenu(); return;
+        }
+        try {
+            const oldPath = target.path;
+            const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${target.handle.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: trimmed }),
+            });
+            if (!resp.ok) throw new Error(`Rename failed: ${resp.status}`);
+            const data = await resp.json();
+            const updatedHandle = this.#makeHandle(data.id, data.name, target.kind);
+            const newPath = oldPath.replace(/[^/]+$/, trimmed);
+            this.tabs.updateTabPaths(oldPath, newPath, updatedHandle, trimmed);
+            await this.mutateAndRebuild();
+            this.state.notify('tabs');
+            this.ui.showToast(`Renamed to ${trimmed}`);
+        } catch (err) {
+            this.ui.showToast(this.#formatError('Rename', err), 4000);
+        }
+        this.ui.closeContextMenu();
+    }
+
+    // ── Move & Copy ────────────────────────────────────────
+    /** Drive API equivalent of original FSA method – moves file/folder via Drive files.update with addParents/removeParents */
+    async moveEntry(srcPath, destFolderPath = '') {
+        const srcNode = this.tree.getNode(srcPath);
+        if (!srcNode) return;
+        if (srcNode.kind === 'directory' && destFolderPath.startsWith(srcPath + '/')) {
+            return this.ui.showToast('Cannot move folder into itself');
+        }
+        try {
+            const destNode = this.tree.getNode(destFolderPath || '/');
+            if (!destNode) return this.ui.showToast('Destination folder not found');
+
+            // Check if entry with same name exists in destination
+            const q = encodeURIComponent(`'${destNode.handle.id}' in parents and name='${srcNode.name.replace(/'/g, "\\'")}' and trashed=false`);
+            const checkResp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files?q=${q}&fields=files(id)&pageSize=1`);
+            if (checkResp.ok) {
+                const checkData = await checkResp.json();
+                if (checkData.files?.length > 0) {
+                    return this.ui.showToast(`"${srcNode.name}" already exists in destination`);
+                }
+            }
+
+            // Get current parents to remove
+            const parentResp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${srcNode.handle.id}?fields=parents`);
+            if (!parentResp.ok) throw new Error(`Move failed: ${parentResp.status}`);
+            const parentData = await parentResp.json();
+            const previousParents = (parentData.parents || []).join(',');
+
+            const resp = await this.#driveRequest(
+                `${GoogleDriveManager.DRIVE_API}/files/${srcNode.handle.id}?addParents=${destNode.handle.id}&removeParents=${previousParents}`,
+                { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+            );
+            if (!resp.ok) throw new Error(`Move failed: ${resp.status}`);
+
+            const newPath = destFolderPath ? `${destFolderPath}/${srcNode.name}` : srcNode.name;
+            this.tabs.updateTabPaths(srcNode.path, newPath, srcNode.handle);
+
+            if (destFolderPath) {
+                this.state.expandedFolders.add(destFolderPath);
+                this.saveExpandedState();
+            }
+            await this.mutateAndRebuild();
+            this.state.notify('tabs');
+            this.ui.showToast(`Moved "${srcNode.name}"`);
+        } catch (e) {
+            this.ui.showToast(this.#formatError('Move', e), 4000);
+        }
+        this.ui.closeContextMenu();
+    }
+
+    /** Drive API equivalent of original FSA method – copies file/folder via Drive files.copy */
+    async copyEntry(srcNode, destFolderPath) {
+        const destNode = this.tree.getNode(destFolderPath || '/');
+        if (!destNode) return this.ui.showToast('Destination folder not found');
+        try {
+            // Check if entry with same name exists
+            const q = encodeURIComponent(`'${destNode.handle.id}' in parents and name='${srcNode.name.replace(/'/g, "\\'")}' and trashed=false`);
+            const checkResp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files?q=${q}&fields=files(id)&pageSize=1`);
+            if (checkResp.ok) {
+                const checkData = await checkResp.json();
+                if (checkData.files?.length > 0) {
+                    return this.ui.showToast(`"${srcNode.name}" already exists in destination`);
+                }
+            }
+
+            if (srcNode.kind === 'file') {
+                const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${srcNode.handle.id}/copy`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: srcNode.name, parents: [destNode.handle.id] }),
+                });
+                if (!resp.ok) throw new Error(`Copy failed: ${resp.status}`);
+            } else {
+                await this.#copyDriveDirectory(srcNode.handle.id, destNode.handle.id, srcNode.name);
+            }
+            if (destFolderPath) {
+                this.state.expandedFolders.add(destFolderPath);
+                this.saveExpandedState();
+            }
+            await this.mutateAndRebuild();
+            this.state.notify('tabs');
+            this.ui.showToast(`Copied "${srcNode.name}"`);
+        } catch (e) {
+            this.ui.showToast(this.#formatError('Copy', e), 4000);
+        }
+        this.ui.closeContextMenu();
+    }
+
+    static #MAX_COPY_DEPTH = 100;
+    /** Recursively copies a Drive directory – Drive API equivalent of original #copyDirectory */
+    async #copyDriveDirectory(srcDirId, destParentId, name, depth = 0) {
+        if (depth >= GoogleDriveManager.#MAX_COPY_DEPTH) {
+            throw new Error(`Directory nesting too deep (>${GoogleDriveManager.#MAX_COPY_DEPTH} levels)`);
+        }
+        // Create destination folder
+        const newFolder = await this.#createDriveFolder(name, destParentId);
+        // List source folder contents
+        const q = encodeURIComponent(`'${srcDirId}' in parents and trashed=false`);
+        const resp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files?q=${q}&fields=files(id,name,mimeType)&pageSize=1000`);
+        if (!resp.ok) throw new Error(`List failed: ${resp.status}`);
+        const data = await resp.json();
+        for (const entry of (data.files || [])) {
+            if (entry.mimeType === GoogleDriveManager.FOLDER_MIME) {
+                await this.#copyDriveDirectory(entry.id, newFolder.id, entry.name, depth + 1);
+            } else {
+                const copyResp = await this.#driveRequest(`${GoogleDriveManager.DRIVE_API}/files/${entry.id}/copy`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: entry.name, parents: [newFolder.id] }),
+                });
+                if (!copyResp.ok) throw new Error(`Copy file failed: ${copyResp.status}`);
+            }
+        }
+    }
+
+    /** Drive API equivalent of original FSA method – compares Drive file IDs */
+    async isSameEntry(h1, h2) {
+        if (!h1 || !h2) return false;
+        return h1.id === h2.id;
     }
 }
 // ────────────────────────────────────────────────────────
@@ -2563,16 +3434,72 @@ class EditorApp {
     constructor() {
         this.state = new ReactiveState();
         this.pathUtils = new PathUtils();
-        this.fs = new FileSystemManager(this.state, this.pathUtils);
+        // Default to Google Drive backend; keep local FS as fallback
+        this.driveFs = new GoogleDriveManager(this.state, this.pathUtils);
+        this.localFs = new FileSystemManager(this.state, this.pathUtils);
+        this.fs = this.driveFs;
         this.tree = new TreeManager(this.state, this.fs);
         this.extensions = new ExtensionManager(this.state, this.fs);
         this.tabs = new TabManager(this.state, this.fs, this.extensions);
         this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions);
-        this.fs.tree = this.tree;
-        this.fs.tabs = this.tabs;
-        this.fs.ui = this.ui;
+        this.#wireBackend(this.fs);
+    }
+    #wireBackend(fs) {
+        fs.tree = this.tree;
+        fs.tabs = this.tabs;
+        fs.ui = this.ui;
         this.extensions.ui = this.ui;
         this.tabs.ui = this.ui;
+    }
+    #clearState() {
+        this.state.currentDirHandle = null;
+        this.state.activeDirectoryPath = null;
+        this.state.expandedFolders.clear();
+        this.state.tabs.forEach(t => { if (t.element) t.element.remove(); if (t.extFrame) t.extFrame.remove(); });
+        this.state.tabs = [];
+        this.state.currentTabId = null;
+        this.tree.clear();
+        this.tree.updateHeader();
+    }
+    #setBackend(fs) {
+        this.fs = fs;
+        this.tree.fs = fs;
+        this.tabs.fs = fs;
+        this.ui.fs = fs;
+        this.extensions.fs = fs;
+        this.#wireBackend(fs);
+    }
+    /** Switches to local File System Access API backend */
+    async switchToLocal() {
+        const prevFs = this.fs;
+        this.#setBackend(this.localFs);
+        this.#clearState();
+        try {
+            await this.localFs.initDB();
+            await this.localFs.openFolder();
+        } catch (e) {
+            // Revert to previous backend if user cancels or picker fails
+            this.#setBackend(prevFs);
+        }
+        if (!this.state.tabs.length) {
+            await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
+        }
+    }
+    /** Switches to Google Drive backend */
+    async switchToDrive() {
+        const prevFs = this.fs;
+        this.#setBackend(this.driveFs);
+        this.#clearState();
+        try {
+            await this.driveFs.initDB();
+            await this.driveFs.openFolder();
+        } catch (e) {
+            // Revert to previous backend if OAuth fails
+            this.#setBackend(prevFs);
+        }
+        if (!this.state.tabs.length) {
+            await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
+        }
     }
     async init() { await this.ui.init(); }
 }
@@ -2581,7 +3508,18 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
-window.onload = async () => { window.editorApp = new EditorApp(); await window.editorApp.init(); };
+window.onload = async () => {
+    window.editorApp = new EditorApp();
+    await window.editorApp.init();
+    // Wire "Switch to Local Folder" button
+    const localBtn = document.getElementById('local-folder-btn');
+    if (localBtn) {
+        if (!('showDirectoryPicker' in window)) {
+            localBtn.style.display = 'none';
+        }
+        localBtn.addEventListener('click', () => window.editorApp.switchToLocal());
+    }
+};
 </script>
 </body>
 </html>
