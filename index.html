@@ -1271,6 +1271,9 @@ class GoogleDriveManager {
         if (typeof google === 'undefined' || !google.accounts?.oauth2) {
             throw new Error('Google Identity Services not loaded');
         }
+        if (GoogleDriveManager.CLIENT_ID.includes('YOUR_CLIENT_ID')) {
+            throw new Error('Replace GoogleDriveManager.CLIENT_ID with your Google Cloud OAuth 2.0 Client ID');
+        }
         this.#tokenClient = google.accounts.oauth2.initTokenClient({
             client_id: GoogleDriveManager.CLIENT_ID,
             scope: GoogleDriveManager.SCOPES,
@@ -3448,20 +3451,25 @@ class EditorApp {
         this.extensions.ui = this.ui;
         this.tabs.ui = this.ui;
     }
-    /** Switches between Google Drive and local File System backends */
-    async switchToLocal() {
-        this.fs = this.localFs;
-        this.tree.fs = this.localFs;
-        this.tabs.fs = this.localFs;
-        this.ui.fs = this.localFs;
-        this.extensions.fs = this.localFs;
-        this.#wireBackend(this.localFs);
-        // Clear current state and open local folder
+    #clearState() {
         this.state.currentDirHandle = null;
         this.state.tabs.forEach(t => { if (t.element) t.element.remove(); if (t.extFrame) t.extFrame.remove(); });
         this.state.tabs = [];
         this.state.currentTabId = null;
         this.tree.clear();
+    }
+    #setBackend(fs) {
+        this.fs = fs;
+        this.tree.fs = fs;
+        this.tabs.fs = fs;
+        this.ui.fs = fs;
+        this.extensions.fs = fs;
+        this.#wireBackend(fs);
+    }
+    /** Switches between Google Drive and local File System backends */
+    async switchToLocal() {
+        this.#setBackend(this.localFs);
+        this.#clearState();
         await this.localFs.initDB();
         await this.localFs.openFolder();
         if (!this.state.tabs.length) {
@@ -3469,17 +3477,8 @@ class EditorApp {
         }
     }
     async switchToDrive() {
-        this.fs = this.driveFs;
-        this.tree.fs = this.driveFs;
-        this.tabs.fs = this.driveFs;
-        this.ui.fs = this.driveFs;
-        this.extensions.fs = this.driveFs;
-        this.#wireBackend(this.driveFs);
-        this.state.currentDirHandle = null;
-        this.state.tabs.forEach(t => { if (t.element) t.element.remove(); if (t.extFrame) t.extFrame.remove(); });
-        this.state.tabs = [];
-        this.state.currentTabId = null;
-        this.tree.clear();
+        this.#setBackend(this.driveFs);
+        this.#clearState();
         await this.driveFs.initDB();
         await this.driveFs.openFolder();
         if (!this.state.tabs.length) {
