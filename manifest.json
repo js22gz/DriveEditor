@@ -1,6 +1,6 @@
 {
-  "name": "Editor",
-  "short_name": "Editor",
+  "name": "Drive Editor",
+  "short_name": "Drive Editor",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#09090b",
