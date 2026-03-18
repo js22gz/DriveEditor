@@ -1272,7 +1272,7 @@ class GoogleDriveManager {
             throw new Error('Google Identity Services not loaded');
         }
         if (GoogleDriveManager.CLIENT_ID.includes('YOUR_CLIENT_ID')) {
-            throw new Error('Replace GoogleDriveManager.CLIENT_ID with your Google Cloud OAuth 2.0 Client ID');
+            throw new Error('Replace GoogleDriveManager.CLIENT_ID with your OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials');
         }
         this.#tokenClient = google.accounts.oauth2.initTokenClient({
             client_id: GoogleDriveManager.CLIENT_ID,
@@ -3453,10 +3453,13 @@ class EditorApp {
     }
     #clearState() {
         this.state.currentDirHandle = null;
+        this.state.activeDirectoryPath = null;
+        this.state.expandedFolders.clear();
         this.state.tabs.forEach(t => { if (t.element) t.element.remove(); if (t.extFrame) t.extFrame.remove(); });
         this.state.tabs = [];
         this.state.currentTabId = null;
         this.tree.clear();
+        this.tree.updateHeader();
     }
     #setBackend(fs) {
         this.fs = fs;
@@ -3466,21 +3469,34 @@ class EditorApp {
         this.extensions.fs = fs;
         this.#wireBackend(fs);
     }
-    /** Switches between Google Drive and local File System backends */
+    /** Switches to local File System Access API backend */
     async switchToLocal() {
+        const prevFs = this.fs;
         this.#setBackend(this.localFs);
         this.#clearState();
-        await this.localFs.initDB();
-        await this.localFs.openFolder();
+        try {
+            await this.localFs.initDB();
+            await this.localFs.openFolder();
+        } catch (e) {
+            // Revert to previous backend if user cancels or picker fails
+            this.#setBackend(prevFs);
+        }
         if (!this.state.tabs.length) {
             await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
         }
     }
+    /** Switches to Google Drive backend */
     async switchToDrive() {
+        const prevFs = this.fs;
         this.#setBackend(this.driveFs);
         this.#clearState();
-        await this.driveFs.initDB();
-        await this.driveFs.openFolder();
+        try {
+            await this.driveFs.initDB();
+            await this.driveFs.openFolder();
+        } catch (e) {
+            // Revert to previous backend if OAuth fails
+            this.#setBackend(prevFs);
+        }
         if (!this.state.tabs.length) {
             await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
         }
