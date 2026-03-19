@@ -195,7 +195,8 @@ header:fullscreen { display: none; }
 #sidebar {
   width: 280px; background: var(--bg-sidebar); border-right: 1px solid var(--border-color);
   display: flex; flex-direction: column; flex-shrink: 0;
-  transition: width 0.2s, opacity 0.2s; overflow: hidden; position: relative;
+  transition: width 0.2s, opacity 0.2s; overflow: hidden;
+  position: relative; /* anchor for .duplicate-sidebar-btn */
 }
 #sidebar.hidden { width: 0; border-right: none; opacity: 0; pointer-events: none; }
 
@@ -1731,11 +1732,11 @@ class DirectoryTreeView {
         this.state.addEventListener('activeDirectoryPathChanged', () => this.highlightActive());
     }
     get fs() { return this.#fs; }
-    set fs(v) { this.#fs = v; for (const lv of this.#linkedViews) lv.fs = v; }
+    set fs(v) { if (this.#fs === v) return; this.#fs = v; for (const lv of this.#linkedViews) lv.fs = v; }
     linkView(view) { this.#linkedViews.push(view); }
     unlinkView(view) { this.#linkedViews = this.#linkedViews.filter(v => v !== view); }
     get fileTree() { return this.#fileTree; }
-    set fileTree(v) { this.#fileTree = v; for (const lv of this.#linkedViews) lv.fileTree = v; }
+    set fileTree(v) { if (this.#fileTree === v) return; this.#fileTree = v; for (const lv of this.#linkedViews) lv.fileTree = v; }
     getNode(path) { return this.#nodeByPath.get(path); }
     registerNode(path, node) { this.#nodeByPath.set(path, node); }
 
@@ -2574,6 +2575,7 @@ class UIManager {
             document.getElementById('duplicate-sidebar-toggle').classList.remove('active');
             if (this.#treeRight) {
                 this.tree.unlinkView(this.#treeRight);
+                this.#treeRight.clear();
                 this.#treeRight = null;
             }
         } else {
