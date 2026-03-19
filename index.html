@@ -55,25 +55,20 @@ window.LEGEND = `<!--
                   │     • open() · get(store,key) · put(store,key,val) · delete(store,key)
                   │     • shared db singleton used by both adapters
                   │
-                  ├── AdapterMessages – centralised error & info strings
-                  │     • formatError / isAbortError / notConnectedMsg / connectSuccessMsg
-                  │       connectionFailedMsg / permissionDeniedMsg / getReadErrorMsg / getSaveErrorMsg
-                  │
-                  ├── StorageAdapter extends AdapterMessages (abstract base)
-                  │     • abstract: queryPermission, loadChildren, connectRoot,
-                  │       readNode, pickFile, CRUD ops, etc.
+                  ├── StorageAdapter (FSA base; #isDrive flag selects per-backend messages)
+                  │     • FSA defaults + private helpers: #guard, #write, #entryExists,
+                  │       #moveFileImpl, #moveDirImpl, #copyDirImpl
+                  │     • formatError / isAbortError / message getters / showPendingAuthToast
+                  │       all branch on #isDrive instead of being overridden per subclass
                   │
                   ├── LocalAdapter extends StorageAdapter (FSA)
-                  │     • File System Access API: showDirectoryPicker, handles,
-                  │       permissions, createWritable, entries()
-                  │     • uses IndexedDBHelper for all IDB access
+                  │     • constructor(pathUtils) → super(false, pathUtils)
+                  │     • overrides only: connectRoot → window.showDirectoryPicker()
                   │
                   ├── DriveAdapter extends StorageAdapter (Google Drive)
                   │     • Google Drive REST v3: OAuth token, multipart upload
                   │     • uses IndexedDBHelper for all IDB access
-                  │     • #api = DriveApiClient (private inner class)
-                  │         – driveRequest (with 401 retry) · uploadMultipart
-                  │         – copyDirectory · makeHandle · findChild · readFile
+                  │     • #api = inner DriveApiClient (dr/up/makeHandle/findChild/readFile/copyDirectory)
                   │
                   ├── FileManager (high-level, delegates to adapter)
                   │     • IndexedDB (handles + extensions) via adapter
@@ -662,73 +657,21 @@ class IndexedDBHelper {
     }
 }
 // ────────────────────────────────────────────────────────
-// AdapterMessages – centralised error & info strings
-// StorageAdapter extends this; adapters override only what differs
+// StorageAdapter – FSA base with shared helpers; DriveAdapter overrides
+// the Drive-specific methods. #isDrive flag selects per-backend messages.
 // ────────────────────────────────────────────────────────
-class AdapterMessages {
-    formatError(action, e) { return `${action} failed: ${e.message || e}`; }
-    isAbortError(e) { return e.name === 'AbortError'; }
-    get notConnectedMsg() { return 'Open a folder first'; }
-    get connectSuccessMsg() { return 'Connected'; }
-    get connectionFailedMsg() { return 'Connection cancelled or failed'; }
-    get permissionDeniedMsg() { return 'Re-open folder to grant access'; }
-    getReadErrorMsg(e) { return 'File too large or unreadable as text'; }
-    getSaveErrorMsg(err) { return 'Save failed'; }
-}
-// ────────────────────────────────────────────────────────
-// StorageAdapter – abstract base class for storage backends
-// ────────────────────────────────────────────────────────
-class StorageAdapter extends AdapterMessages {
-    constructor() {
-        super();
+class StorageAdapter {
+    static MAX_COPY_DEPTH = 100;
+    #isDrive;
+    /** @param {boolean} isDrive @param {PathUtils|null} pathUtils */
+    constructor(isDrive = false, pathUtils = null) {
+        this.#isDrive = isDrive;
+        this.pathUtils = pathUtils;
         /** @type {UIManager} */ this.ui = null;
     }
-    /** Returns the shared IDB instance (opened on demand via IndexedDBHelper) */
     get db() { return IndexedDBHelper.db; }
-    // ── DB & persistence ──────────────────────────────────
     async initDB() { await IndexedDBHelper.open(); }
-    async saveFolderHandle(handle) { throw new Error('StorageAdapter: saveFolderHandle is abstract'); }
-    async loadSavedFolder() { throw new Error('StorageAdapter: loadSavedFolder is abstract'); }
-    async clearSessionData() { throw new Error('StorageAdapter: clearSessionData is abstract'); }
-    // ── Auth / Permissions ────────────────────────────────
-    async queryPermission(handle) { throw new Error('StorageAdapter: queryPermission is abstract'); }
-    async ensurePermission(handle, action) { throw new Error('StorageAdapter: ensurePermission is abstract'); }
-    // ── Tree ──────────────────────────────────────────────
-    async loadChildren(dirNode) { throw new Error('StorageAdapter: loadChildren is abstract'); }
-    // ── Connect ───────────────────────────────────────────
-    async connectRoot() { throw new Error('StorageAdapter: connectRoot is abstract'); }
-    // ── File I/O ──────────────────────────────────────────
-    async readNode(node) { throw new Error('StorageAdapter: readNode is abstract'); }
-    async pickFile() { throw new Error('StorageAdapter: pickFile is abstract'); }
-    async openNodeInBrowser(node) { throw new Error('StorageAdapter: openNodeInBrowser is abstract'); }
-    // ── Target directory ──────────────────────────────────
-    async resolveTargetDir(contextMenuTarget, activeDirPath, rootHandle, getNode) { throw new Error('StorageAdapter: resolveTargetDir is abstract'); }
-    // ── CRUD ──────────────────────────────────────────────
-    async createFile(name, dirCtx) { throw new Error('StorageAdapter: createFile is abstract'); }
-    async createFolder(name, dirCtx) { throw new Error('StorageAdapter: createFolder is abstract'); }
-    async listRootNames(rootHandle) { throw new Error('StorageAdapter: listRootNames is abstract'); }
-    async writeFile(handle, content) { throw new Error('StorageAdapter: writeFile is abstract'); }
-    async deleteFileEntry(target, rootHandle) { throw new Error('StorageAdapter: deleteFileEntry is abstract'); }
-    async deleteFolderEntry(target, rootHandle) { throw new Error('StorageAdapter: deleteFolderEntry is abstract'); }
-    async renameEntry(target, newName, rootHandle) { throw new Error('StorageAdapter: renameEntry is abstract'); }
-    async existsInDir(destNode, name) { throw new Error('StorageAdapter: existsInDir is abstract'); }
-    async moveEntryImpl(srcNode, destNode, rootHandle) { throw new Error('StorageAdapter: moveEntryImpl is abstract'); }
-    async copyEntryImpl(srcNode, destNode) { throw new Error('StorageAdapter: copyEntryImpl is abstract'); }
-    async isSameEntry(h1, h2) { throw new Error('StorageAdapter: isSameEntry is abstract'); }
-    // ── Pending auth toast ────────────────────────────────
-    showPendingAuthToast(ui, handle, onSuccess) { throw new Error('StorageAdapter: showPendingAuthToast is abstract'); }
-}
-// ────────────────────────────────────────────────────────
-// LocalAdapter – File System Access API backend
-// ────────────────────────────────────────────────────────
-class LocalAdapter extends StorageAdapter {
-    #INVALID_CHARS = /[<>:"|?*\x00-\x1F]/;
-    /** @param {PathUtils} pathUtils */
-    constructor(pathUtils) {
-        super();
-        this.pathUtils = pathUtils;
-    }
-    // ── Core helpers ──────────────────────────────────────
+    // ── Private FSA helpers ───────────────────────────────
     async #guard(handle, action = 'operation') {
         if (!handle) throw new Error('No handle');
         let perm = await this.queryPermission(handle);
@@ -743,28 +686,62 @@ class LocalAdapter extends StorageAdapter {
         await writable.close();
     }
     async #entryExists(dirHandle, name) {
-        try {
-            await dirHandle.getFileHandle(name);
-            return true;
-        } catch (e) { if (e.name !== 'NotFoundError') throw e; }
-        try {
-            await dirHandle.getDirectoryHandle(name);
-            return true;
-        } catch (e) { if (e.name !== 'NotFoundError') throw e; }
+        try { await dirHandle.getFileHandle(name); return true; } catch (e) { if (e.name !== 'NotFoundError') throw e; }
+        try { await dirHandle.getDirectoryHandle(name); return true; } catch (e) { if (e.name !== 'NotFoundError') throw e; }
         return false;
+    }
+    async #moveFileImpl(srcNode, srcParent, destHandle) {
+        if (srcNode.handle.move) {
+            await srcNode.handle.move(destHandle, srcNode.name);
+        } else {
+            const file = await srcNode.handle.getFile();
+            const newHandle = await destHandle.getFileHandle(srcNode.name, { create: true });
+            await this.#write(newHandle, file);
+            await srcParent.removeEntry(srcNode.name);
+        }
+    }
+    async #moveDirImpl(srcNode, srcParent, destHandle, rootHandle) {
+        let moved = false;
+        if (srcNode.handle.move) {
+            try { await srcNode.handle.move(destHandle, srcNode.name); moved = true; } catch {}
+        }
+        if (!moved) {
+            await this.#copyDirImpl(srcNode.handle, destHandle, srcNode.name);
+            const { parent } = await this.pathUtils.resolve(rootHandle, srcNode.path);
+            await parent.removeEntry(srcNode.name, { recursive: true });
+        }
+    }
+    async #copyDirImpl(srcDirHandle, destParent, name) {
+        const stack = [{ src: srcDirHandle, dest: destParent, name, depth: 0 }];
+        try {
+            while (stack.length > 0) {
+                const { src, dest, name: dirName, depth } = stack.pop();
+                if (depth >= StorageAdapter.MAX_COPY_DEPTH)
+                    throw new Error(`Directory nesting too deep (max ${StorageAdapter.MAX_COPY_DEPTH} levels)`);
+                const newDir = await dest.getDirectoryHandle(dirName, { create: true });
+                for await (const [entryName, entryHandle] of src.entries()) {
+                    if (entryHandle.kind === 'file') {
+                        const file = await entryHandle.getFile();
+                        const newHandle = await newDir.getFileHandle(entryName, { create: true });
+                        await this.#write(newHandle, file);
+                    } else {
+                        stack.push({ src: entryHandle, dest: newDir, name: entryName, depth: depth + 1 });
+                    }
+                }
+            }
+        } catch (e) {
+            try { await destParent.removeEntry(name, { recursive: true }); } catch {}
+            throw e;
+        }
     }
     // ── Auth / Permissions ────────────────────────────────
     async queryPermission(handle) {
         if (!handle) return 'denied';
         try { return await handle.queryPermission({ mode: 'readwrite' }); } catch { return 'denied'; }
     }
-    async ensurePermission(handle, action = 'operation') {
-        return this.#guard(handle, action);
-    }
-    // ── DB ────────────────────────────────────────────────
-    async saveFolderHandle(handle) {
-        await IndexedDBHelper.put('handles', 'main', handle);
-    }
+    async ensurePermission(handle, action = 'operation') { return this.#guard(handle, action); }
+    // ── DB & persistence ──────────────────────────────────
+    async saveFolderHandle(handle) { await IndexedDBHelper.put('handles', 'main', handle); }
     async loadSavedFolder() {
         const handle = await IndexedDBHelper.get('handles', 'main');
         if (!handle) return { status: 'none' };
@@ -773,13 +750,9 @@ class LocalAdapter extends StorageAdapter {
         try {
             const granted = await handle.requestPermission({ mode: 'readwrite' });
             return granted === 'granted' ? { status: 'granted', handle } : { status: 'needs-auth', handle };
-        } catch {
-            return { status: 'needs-auth', handle };
-        }
+        } catch { return { status: 'needs-auth', handle }; }
     }
-    async clearSessionData() {
-        await IndexedDBHelper.delete('handles', 'main');
-    }
+    async clearSessionData() { await IndexedDBHelper.delete('handles', 'main'); }
     // ── Tree ──────────────────────────────────────────────
     async loadChildren(dirNode) {
         if (dirNode.kind !== 'directory' || dirNode.childrenLoaded) return;
@@ -804,24 +777,16 @@ class LocalAdapter extends StorageAdapter {
         dirNode.childrenLoaded = true;
     }
     // ── Connect ───────────────────────────────────────────
-    async connectRoot() {
-        return window.showDirectoryPicker();
-    }
+    async connectRoot() { throw new Error('StorageAdapter: connectRoot is abstract'); }
     // ── File I/O ──────────────────────────────────────────
-    async readNode(node) {
-        const file = await node.handle.getFile();
-        return file.text();
-    }
+    async readNode(node) { const file = await node.handle.getFile(); return file.text(); }
     async pickFile() {
         try {
             const [handle] = await window.showOpenFilePicker();
             const file = await handle.getFile();
             const content = await file.text();
             return { handle, name: file.name, content };
-        } catch (e) {
-            if (e.name === 'AbortError') return null;
-            throw e;
-        }
+        } catch (e) { if (e.name === 'AbortError') return null; throw e; }
     }
     async openNodeInBrowser(node) {
         const file = await node.handle.getFile();
@@ -831,9 +796,7 @@ class LocalAdapter extends StorageAdapter {
     }
     // ── Target directory ──────────────────────────────────
     async resolveTargetDir(contextMenuTarget, activeDirPath, rootHandle, getNode) {
-        const targetPath = contextMenuTarget?.kind === 'directory'
-            ? contextMenuTarget.path
-            : (activeDirPath || '');
+        const targetPath = contextMenuTarget?.kind === 'directory' ? contextMenuTarget.path : (activeDirPath || '');
         const { parent, name } = await this.pathUtils.resolve(rootHandle, targetPath);
         const dir = targetPath ? await parent.getDirectoryHandle(name) : parent;
         await this.#guard(dir);
@@ -845,17 +808,13 @@ class LocalAdapter extends StorageAdapter {
         await this.#write(handle, '');
         return handle;
     }
-    async createFolder(name, dirCtx) {
-        return dirCtx.getDirectoryHandle(name, { create: true });
-    }
+    async createFolder(name, dirCtx) { return dirCtx.getDirectoryHandle(name, { create: true }); }
     async listRootNames(rootHandle) {
         const names = new Set();
         try { for await (const [name] of rootHandle.entries()) names.add(name); } catch {}
         return names;
     }
-    async writeFile(handle, content) {
-        return this.#write(handle, content);
-    }
+    async writeFile(handle, content) { return this.#write(handle, content); }
     async deleteFileEntry(target, rootHandle) {
         const { parent, name } = await this.pathUtils.resolve(rootHandle, target.path);
         await this.#guard(parent);
@@ -885,9 +844,7 @@ class LocalAdapter extends StorageAdapter {
         const newPath = target.path.replace(/[^/]+$/, newName);
         return { updatedHandle, newPath };
     }
-    async existsInDir(destNode, name) {
-        return this.#entryExists(destNode.handle, name);
-    }
+    async existsInDir(destNode, name) { return this.#entryExists(destNode.handle, name); }
     async moveEntryImpl(srcNode, destNode, rootHandle) {
         const { parent: srcParent } = await this.pathUtils.resolve(rootHandle, srcNode.path);
         await this.#guard(srcParent);
@@ -897,27 +854,6 @@ class LocalAdapter extends StorageAdapter {
             await this.#moveDirImpl(srcNode, srcParent, destNode.handle, rootHandle);
         } else {
             await this.#moveFileImpl(srcNode, srcParent, destNode.handle);
-        }
-    }
-    async #moveFileImpl(srcNode, srcParent, destHandle) {
-        if (srcNode.handle.move) {
-            await srcNode.handle.move(destHandle, srcNode.name);
-        } else {
-            const file = await srcNode.handle.getFile();
-            const newHandle = await destHandle.getFileHandle(srcNode.name, { create: true });
-            await this.#write(newHandle, file);
-            await srcParent.removeEntry(srcNode.name);
-        }
-    }
-    async #moveDirImpl(srcNode, srcParent, destHandle, rootHandle) {
-        let moved = false;
-        if (srcNode.handle.move) {
-            try { await srcNode.handle.move(destHandle, srcNode.name); moved = true; } catch {}
-        }
-        if (!moved) {
-            await this.#copyDirImpl(srcNode.handle, destHandle, srcNode.name);
-            const { parent } = await this.pathUtils.resolve(rootHandle, srcNode.path);
-            await parent.removeEntry(srcNode.name, { recursive: true });
         }
     }
     async copyEntryImpl(srcNode, destNode) {
@@ -930,65 +866,62 @@ class LocalAdapter extends StorageAdapter {
             await this.#copyDirImpl(srcNode.handle, destNode.handle, srcNode.name);
         }
     }
-    static #MAX_COPY_DEPTH = 100;
-    async #copyDirImpl(srcDirHandle, destParent, name) {
-        const stack = [{ src: srcDirHandle, dest: destParent, name, depth: 0 }];
-        try {
-            while (stack.length > 0) {
-                const { src, dest, name: dirName, depth } = stack.pop();
-                if (depth >= LocalAdapter.#MAX_COPY_DEPTH) {
-                    throw new Error(`Directory nesting too deep (max ${LocalAdapter.#MAX_COPY_DEPTH} levels)`);
-                }
-                const newDir = await dest.getDirectoryHandle(dirName, { create: true });
-                for await (const [entryName, entryHandle] of src.entries()) {
-                    if (entryHandle.kind === 'file') {
-                        const file = await entryHandle.getFile();
-                        const newHandle = await newDir.getFileHandle(entryName, { create: true });
-                        await this.#write(newHandle, file);
-                    } else {
-                        stack.push({ src: entryHandle, dest: newDir, name: entryName, depth: depth + 1 });
-                    }
-                }
-            }
-        } catch (e) {
-            try { await destParent.removeEntry(name, { recursive: true }); } catch {}
-            throw e;
-        }
-    }
     async isSameEntry(h1, h2) { return !!h1 && !!h2 && h1.isSameEntry(h2); }
-    // ── Messages ──────────────────────────────────────────
+    // ── Messages (both backends via #isDrive) ─────────────
     formatError(action, e) {
-        if (e.name === 'NotAllowedError') return `${action} failed: permission denied – re-open folder`;
-        if (e.name === 'QuotaExceededError') return `${action} failed: not enough disk space`;
-        if (e.name === 'NotFoundError') return `${action} failed: file/folder not found`;
+        if (this.#isDrive) {
+            if (e.message?.includes('permission') || e.message?.includes('403')) return `${action} failed: permission denied – reconnect Google account`;
+            if (e.message?.includes('quota') || e.message?.includes('429')) return `${action} failed: rate limit exceeded, try again`;
+            if (e.message?.includes('404') || e.message?.includes('not found')) return `${action} failed: file/folder not found`;
+        } else {
+            if (e.name === 'NotAllowedError') return `${action} failed: permission denied – re-open folder`;
+            if (e.name === 'QuotaExceededError') return `${action} failed: not enough disk space`;
+            if (e.name === 'NotFoundError') return `${action} failed: file/folder not found`;
+        }
         return `${action} failed: ${e.message || e}`;
     }
-    get connectSuccessMsg() { return 'Folder opened successfully'; }
-    get connectionFailedMsg() { return 'Open folder cancelled or failed'; }
+    isAbortError(e) { return this.#isDrive ? e.message === 'popup_closed_by_user' : e.name === 'AbortError'; }
+    get notConnectedMsg() { return this.#isDrive ? 'Connect Google Account first' : 'Open a folder first'; }
+    get connectSuccessMsg() { return this.#isDrive ? 'Google Drive connected ✓' : 'Folder opened successfully'; }
+    get connectionFailedMsg() { return this.#isDrive ? 'Google Drive connection cancelled or failed' : 'Open folder cancelled or failed'; }
+    get permissionDeniedMsg() { return this.#isDrive ? 'Reconnect Google account to grant access' : 'Re-open folder to grant access'; }
     getReadErrorMsg(e) {
+        if (this.#isDrive) return (e.message.includes('permission') || e.message.includes('403')) ? 'Reconnect Google account to grant access' : 'File too large or unreadable as text';
         return e.message.includes('permission') ? 'Re-open folder to grant write access' : 'File too large or unreadable as text';
     }
     getSaveErrorMsg(err) {
+        if (this.#isDrive) return err.message.includes('403') ? 'Reconnect Google account' : 'Save failed';
         return err.message.includes('permission') ? 'Re-authorize folder' : 'Save failed';
     }
     showPendingAuthToast(ui, handle, onSuccess) {
-        ui.showActionToast('Tap to restore folder access', async () => {
+        const label = this.#isDrive ? 'Tap to reconnect Google Account' : 'Tap to restore folder access';
+        const successMsg = this.#isDrive ? 'Google Drive access restored ✓' : 'Folder access restored ✓';
+        ui.showActionToast(label, async () => {
             try {
-                if (await handle.requestPermission({ mode: 'readwrite' }) !== 'granted') {
-                    ui.showToast('Access was not granted');
-                    return;
+                if (this.#isDrive) {
+                    await this.ensurePermission(handle);
+                } else {
+                    if (await handle.requestPermission({ mode: 'readwrite' }) !== 'granted') {
+                        return ui.showToast('Access was not granted');
+                    }
                 }
                 await onSuccess(handle);
-                ui.showToast('Folder access restored ✓');
-            } catch {
-                ui.showToast('Failed to restore access');
-            }
+                ui.showToast(successMsg);
+            } catch { ui.showToast('Failed to restore access'); }
         }, 15000);
     }
 }
 // ────────────────────────────────────────────────────────
+// LocalAdapter – File System Access API backend
+// Inherits all FSA implementations from StorageAdapter; only connectRoot differs.
+// ────────────────────────────────────────────────────────
+class LocalAdapter extends StorageAdapter {
+    /** @param {PathUtils} pathUtils */
+    constructor(pathUtils) { super(false, pathUtils); }
+    async connectRoot() { return window.showDirectoryPicker(); }
+}
+// ────────────────────────────────────────────────────────
 // DriveAdapter – Google Drive REST v3 backend
-// (Drive API equivalent of LocalAdapter for Google Drive operation)
 // ────────────────────────────────────────────────────────
 class DriveAdapter extends StorageAdapter {
     #accessToken = null;
@@ -1000,131 +933,96 @@ class DriveAdapter extends StorageAdapter {
     static DRIVE_API = 'https://www.googleapis.com/drive/v3';
     static UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
     static FOLDER_MIME = 'application/vnd.google-apps.folder';
-    static #MAX_COPY_DEPTH = 100;
 
-    // ── DriveApiClient – private inner class ─────────────
-    // Encapsulates all low-level Drive REST calls so DriveAdapter stays thin.
     #api = (() => {
         const adapter = this;
-        return new class DriveApiClient {
-            /** Drive API fetch wrapper with auto-retry on 401 */
-            async driveRequest(url, options = {}) {
-                const token = await adapter.#ensureToken();
-                const headers = { 'Authorization': `Bearer ${token}`, ...(options.headers || {}) };
-                let resp = await fetch(url, { ...options, headers });
-                if (resp.status === 401) {
+        return new class {
+            async dr(url, o = {}) {
+                const tok = await adapter.#ensureToken();
+                const h = { 'Authorization': `Bearer ${tok}`, ...(o.headers || {}) };
+                let r = await fetch(url, { ...o, headers: h });
+                if (r.status === 401) {
                     adapter.#accessToken = null;
-                    const newToken = await adapter.#ensureToken();
-                    headers['Authorization'] = `Bearer ${newToken}`;
-                    resp = await fetch(url, { ...options, headers });
+                    h['Authorization'] = `Bearer ${await adapter.#ensureToken()}`;
+                    r = await fetch(url, { ...o, headers: h });
                 }
-                return resp;
+                return r;
             }
-            /** Shared multipart body builder for file create (POST) and update (PATCH) */
-            async uploadMultipart(url, method, metadataObj, content) {
-                const boundary = '---drive-boundary-' + Date.now();
-                const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadataObj)}\r\n--${boundary}\r\nContent-Type: text/plain\r\n\r\n${content}\r\n--${boundary}--`;
-                return this.driveRequest(url, {
+            async up(url, method, meta, content) {
+                const b = '---drive-boundary-' + Date.now();
+                return this.dr(url, {
                     method,
-                    headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
-                    body,
+                    headers: { 'Content-Type': `multipart/related; boundary=${b}` },
+                    body: `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${b}\r\nContent-Type: text/plain\r\n\r\n${content}\r\n--${b}--`,
                 });
             }
-            /** Creates a fake handle object for Drive entries */
             makeHandle(id, name, kind) {
-                const api = this;
-                const handle = { id, name, kind };
+                const api = this, h = { id, name, kind };
                 if (kind === 'directory') {
-                    handle.getDirectoryHandle = async (childName) => api.findChild(id, childName, 'directory');
-                    handle.getFileHandle = async (childName, opts) => api.findChild(id, childName, 'file', opts);
+                    h.getDirectoryHandle = (childName) => api.findChild(id, childName, 'directory');
+                    h.getFileHandle = (childName, opts) => api.findChild(id, childName, 'file', opts);
                 }
-                if (kind === 'file') {
-                    handle.getFile = async () => api.readFile(id, name);
-                }
-                handle.isSameEntry = (other) => other?.id === id;
-                return handle;
+                if (kind === 'file') h.getFile = () => api.readFile(id, name);
+                h.isSameEntry = (other) => other?.id === id;
+                return h;
             }
-            /** Finds a child entry in a Drive folder by name and kind */
             async findChild(parentId, childName, kind, opts) {
-                const mimeFilter = kind === 'directory'
-                    ? `and mimeType='${DriveAdapter.FOLDER_MIME}'`
-                    : `and mimeType!='${DriveAdapter.FOLDER_MIME}'`;
+                const mimeFilter = kind === 'directory' ? `and mimeType='${DriveAdapter.FOLDER_MIME}'` : `and mimeType!='${DriveAdapter.FOLDER_MIME}'`;
                 const q = encodeURIComponent(`'${parentId}' in parents and name='${childName.replace(/'/g, "\\'")}' ${mimeFilter} and trashed=false`);
-                const resp = await this.driveRequest(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(id,name)&pageSize=1`);
-                if (!resp.ok) throw new DOMException('Not found', 'NotFoundError');
-                const data = await resp.json();
-                if (!data.files?.length) {
+                const r = await this.dr(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(id,name)&pageSize=1`);
+                if (!r.ok) throw new DOMException('Not found', 'NotFoundError');
+                const { files } = await r.json();
+                if (!files?.length) {
                     if (kind === 'file' && opts?.create) {
-                        const cr = await this.uploadMultipart(
-                            `${DriveAdapter.UPLOAD_API}/files?uploadType=multipart&fields=id,name`,
-                            'POST', { name: childName, parents: [parentId] }, ''
-                        );
+                        const cr = await this.up(`${DriveAdapter.UPLOAD_API}/files?uploadType=multipart&fields=id,name`, 'POST', { name: childName, parents: [parentId] }, '');
                         if (!cr.ok) throw new Error(`Create file failed: ${cr.status}`);
-                        const d = await cr.json();
-                        return this.makeHandle(d.id, d.name, 'file');
+                        const fd = await cr.json();
+                        return this.makeHandle(fd.id, fd.name, 'file');
                     }
                     throw new DOMException('Not found', 'NotFoundError');
                 }
-                return this.makeHandle(data.files[0].id, data.files[0].name, kind);
+                return this.makeHandle(files[0].id, files[0].name, kind);
             }
-            /** Reads file content from Drive (used by fake file handles) */
-            async readFile(fileId, name) {
-                const resp = await this.driveRequest(`${DriveAdapter.DRIVE_API}/files/${fileId}?alt=media`);
-                if (!resp.ok) throw new Error(`Read failed: ${resp.status}`);
-                const text = await resp.text();
-                return { text: () => Promise.resolve(text), name };
+            async readFile(id, name) {
+                const r = await this.dr(`${DriveAdapter.DRIVE_API}/files/${id}?alt=media`);
+                if (!r.ok) throw new Error(`Read failed: ${r.status}`);
+                return { text: () => r.text(), name };
             }
-            /** Recursively copies a Drive directory */
-            async copyDirectory(srcDirId, destParentId, name, depth = 0) {
-                if (depth >= DriveAdapter.#MAX_COPY_DEPTH) {
-                    throw new Error(`Directory nesting too deep (max ${DriveAdapter.#MAX_COPY_DEPTH} levels)`);
-                }
-                const folderResp = await this.driveRequest(`${DriveAdapter.DRIVE_API}/files`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, mimeType: DriveAdapter.FOLDER_MIME, parents: [destParentId] }),
+            async copyDirectory(srcId, destId, name, depth = 0) {
+                if (depth >= StorageAdapter.MAX_COPY_DEPTH)
+                    throw new Error(`Directory nesting too deep (max ${StorageAdapter.MAX_COPY_DEPTH} levels)`);
+                const fr = await this.dr(`${DriveAdapter.DRIVE_API}/files`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, mimeType: DriveAdapter.FOLDER_MIME, parents: [destId] }),
                 });
-                if (!folderResp.ok) throw new Error(`Create folder failed: ${folderResp.status}`);
-                const newFolder = await folderResp.json();
-                const q = encodeURIComponent(`'${srcDirId}' in parents and trashed=false`);
-                const resp = await this.driveRequest(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(id,name,mimeType)&pageSize=1000`);
-                if (!resp.ok) throw new Error(`List failed: ${resp.status}`);
-                const data = await resp.json();
-                for (const entry of (data.files || [])) {
-                    if (entry.mimeType === DriveAdapter.FOLDER_MIME) {
-                        await this.copyDirectory(entry.id, newFolder.id, entry.name, depth + 1);
+                if (!fr.ok) throw new Error(`Create folder failed: ${fr.status}`);
+                const { id: newFolderId } = await fr.json();
+                const q = encodeURIComponent(`'${srcId}' in parents and trashed=false`);
+                const lr = await this.dr(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(id,name,mimeType)&pageSize=1000`);
+                if (!lr.ok) throw new Error(`List failed: ${lr.status}`);
+                for (const e of ((await lr.json()).files ?? [])) {
+                    if (e.mimeType === DriveAdapter.FOLDER_MIME) {
+                        await this.copyDirectory(e.id, newFolderId, e.name, depth + 1);
                     } else {
-                        const copyResp = await this.driveRequest(`${DriveAdapter.DRIVE_API}/files/${entry.id}/copy`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ name: entry.name, parents: [newFolder.id] }),
+                        const cr = await this.dr(`${DriveAdapter.DRIVE_API}/files/${e.id}/copy`, {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name: e.name, parents: [newFolderId] }),
                         });
-                        if (!copyResp.ok) throw new Error(`Copy file failed: ${copyResp.status}`);
+                        if (!cr.ok) throw new Error(`Copy file failed: ${cr.status}`);
                     }
                 }
             }
         }();
     })();
 
-    constructor() {
-        super();
-    }
+    constructor() { super(true); }
 
-    // ── Drive API helpers ─────────────────────────────────
-    /** Ensures a valid access token, refreshing silently if expired */
     async #ensureToken() {
-        if (this.#accessToken && Date.now() < this.#tokenExpiresAt - 60000) {
-            return this.#accessToken;
-        }
+        if (this.#accessToken && Date.now() < this.#tokenExpiresAt - 60000) return this.#accessToken;
         return new Promise((resolve, reject) => {
-            if (!this.#tokenClient) {
-                this.#initTokenClient();
-            }
+            if (!this.#tokenClient) this.#initTokenClient();
             this.#tokenClient.callback = (resp) => {
-                if (resp.error) {
-                    reject(new Error(resp.error));
-                    return;
-                }
+                if (resp.error) { reject(new Error(resp.error)); return; }
                 this.#accessToken = resp.access_token;
                 this.#tokenExpiresAt = Date.now() + (resp.expires_in * 1000);
                 this.#saveTokenToDB();
@@ -1133,37 +1031,22 @@ class DriveAdapter extends StorageAdapter {
             this.#tokenClient.requestAccessToken({ prompt: this.#accessToken ? '' : 'consent' });
         });
     }
-
     #initTokenClient() {
-        if (typeof google === 'undefined' || !google.accounts?.oauth2) {
+        if (typeof google === 'undefined' || !google.accounts?.oauth2)
             throw new Error('Google Identity Services not loaded');
-        }
-        if (DriveAdapter.CLIENT_ID.includes('YOUR_CLIENT_ID')) {
+        if (DriveAdapter.CLIENT_ID.includes('YOUR_CLIENT_ID'))
             throw new Error('Replace DriveAdapter.CLIENT_ID with your OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials');
-        }
         this.#tokenClient = google.accounts.oauth2.initTokenClient({
-            client_id: DriveAdapter.CLIENT_ID,
-            scope: DriveAdapter.SCOPES,
-            callback: () => {},
+            client_id: DriveAdapter.CLIENT_ID, scope: DriveAdapter.SCOPES, callback: () => {},
         });
     }
-
-    /** Public wrapper used by TabManager.restoreOpenTabs to reconstruct a file handle from a saved Drive file ID */
     makeFileHandle(id, name) { return this.#api.makeHandle(id, name, 'file'); }
-
-    // ── DB & persistence ───────────────────────────────────
-    /** Drive API equivalent of original FSA method – saves root folder ID to IndexedDB */
     async saveFolderHandle(handle) {
         await IndexedDBHelper.put('handles', 'main', { id: handle.id, name: handle.name, kind: 'directory' });
     }
-
     async #saveTokenToDB() {
-        await IndexedDBHelper.put('handles', 'driveToken', {
-            token: this.#accessToken,
-            expiresAt: this.#tokenExpiresAt,
-        });
+        await IndexedDBHelper.put('handles', 'driveToken', { token: this.#accessToken, expiresAt: this.#tokenExpiresAt });
     }
-
     async #loadTokenFromDB() {
         const data = await IndexedDBHelper.get('handles', 'driveToken');
         if (data?.token && data.expiresAt > Date.now() + 60000) {
@@ -1171,22 +1054,12 @@ class DriveAdapter extends StorageAdapter {
             this.#tokenExpiresAt = data.expiresAt;
         }
     }
-
-    /** Drive API equivalent of original FSA method – always returns 'granted' when token is valid */
     async queryPermission(handle) {
         if (!handle) return 'denied';
         if (this.#accessToken && Date.now() < this.#tokenExpiresAt - 60000) return 'granted';
-        try {
-            await this.#ensureToken();
-            return 'granted';
-        } catch { return 'denied'; }
+        try { await this.#ensureToken(); return 'granted'; } catch { return 'denied'; }
     }
-
-    async ensurePermission(handle, action = 'operation') {
-        return this.#ensureToken();
-    }
-
-    /** Drive API equivalent of original FSA method – loads saved Drive root folder */
+    async ensurePermission(handle, action = 'operation') { return this.#ensureToken(); }
     async loadSavedFolder() {
         await IndexedDBHelper.open();
         await this.#loadTokenFromDB();
@@ -1195,23 +1068,18 @@ class DriveAdapter extends StorageAdapter {
         const handle = this.#api.makeHandle(data.id, data.name || 'My Drive', 'directory');
         if (this.#accessToken) {
             try {
-                const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/about?fields=user`, {});
+                const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/about?fields=user`, {});
                 if (resp.ok) return { status: 'granted', handle };
             } catch {}
         }
         return { status: 'needs-auth', handle };
     }
-
-    /** Drive API equivalent of original FSA method – clears saved Drive connection */
     async clearSessionData() {
         await IndexedDBHelper.delete('handles', 'main');
         await IndexedDBHelper.delete('handles', 'driveToken');
         this.#accessToken = null;
         this.#tokenExpiresAt = 0;
     }
-
-    // ── Tree ──────────────────────────────────────────────
-    /** Drive API equivalent of original FSA method – lists children of a Drive folder via files.list */
     async loadChildren(dirNode) {
         if (dirNode.kind !== 'directory' || dirNode.childrenLoaded) return;
         dirNode.children = [];
@@ -1223,7 +1091,7 @@ class DriveAdapter extends StorageAdapter {
             const allEntries = [];
             do {
                 const url = `${DriveAdapter.DRIVE_API}/files?q=${q}&fields=nextPageToken,${fields}&pageSize=1000${pageToken ? '&pageToken=' + pageToken : ''}`;
-                const resp = await this.#api.driveRequest(url);
+                const resp = await this.#api.dr(url);
                 if (!resp.ok) throw new Error(`List failed: ${resp.status}`);
                 const data = await resp.json();
                 for (const f of (data.files || [])) {
@@ -1233,11 +1101,9 @@ class DriveAdapter extends StorageAdapter {
                 }
                 pageToken = data.nextPageToken || '';
             } while (pageToken);
-
             allEntries.sort((a, b) =>
                 (a.kind !== b.kind ? (a.kind === 'directory' ? -1 : 1) : a.name.localeCompare(b.name, undefined, { numeric: true }))
             );
-
             for (const entry of allEntries) {
                 const path = dirNode.path === '/' ? entry.name : `${dirNode.path}/${entry.name}`;
                 const handle = this.#api.makeHandle(entry.id, entry.name, entry.kind);
@@ -1249,120 +1115,74 @@ class DriveAdapter extends StorageAdapter {
         } catch (e) { console.warn('loadChildren failed', e); }
         dirNode.childrenLoaded = true;
     }
-
-    // ── Connect ───────────────────────────────────────────
-    /** Drive API equivalent of original FSA method – connects Google account and sets root to My Drive */
     async connectRoot() {
         await this.#ensureToken();
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/root?fields=id,name`);
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/root?fields=id,name`);
         if (!resp.ok) throw new Error(`Root failed: ${resp.status}`);
         const rootInfo = await resp.json();
         return this.#api.makeHandle(rootInfo.id, 'My Drive', 'directory');
     }
-
-    // ── File I/O ──────────────────────────────────────────
-    /** Drive API equivalent of original FSA method – reads file content from Drive via files.get with alt=media */
     async readNode(node) {
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?alt=media`);
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?alt=media`);
         if (!resp.ok) throw new Error(`Read failed: ${resp.status}`);
         return resp.text();
     }
-
-    /** Drive API equivalent of original FSA method – not applicable for Drive, shows toast */
-    async pickFile() {
-        this.ui.showToast('Use the file tree to open files from Google Drive');
-        return null;
-    }
-
-    /** Drive API equivalent of original FSA method – opens Drive file in browser via webViewLink */
+    async pickFile() { this.ui.showToast('Use the file tree to open files from Google Drive'); return null; }
     async openNodeInBrowser(node) {
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?fields=webViewLink`);
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?fields=webViewLink`);
         if (!resp.ok) throw new Error('Failed to get link');
         const data = await resp.json();
         if (data.webViewLink) {
             window.open(data.webViewLink, '_blank');
         } else {
-            const dlResp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?alt=media`);
+            const dlResp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?alt=media`);
             const blob = await dlResp.blob();
             const url = URL.createObjectURL(blob);
             window.open(url, '_blank');
             setTimeout(() => URL.revokeObjectURL(url), 60_000);
         }
     }
-
-    // ── Target directory ──────────────────────────────────
-    /** Drive API equivalent of original FSA method – resolves target folder ID for new items */
     async resolveTargetDir(contextMenuTarget, activeDirPath, rootHandle, getNode) {
-        const targetPath = contextMenuTarget?.kind === 'directory'
-            ? contextMenuTarget.path
-            : (activeDirPath || '');
-        if (!targetPath || targetPath === '/') {
-            return { dirCtx: rootHandle.id, targetPath: '' };
-        }
+        const targetPath = contextMenuTarget?.kind === 'directory' ? contextMenuTarget.path : (activeDirPath || '');
+        if (!targetPath || targetPath === '/') return { dirCtx: rootHandle.id, targetPath: '' };
         const node = getNode(targetPath);
         if (!node) return { dirCtx: rootHandle.id, targetPath: '' };
         return { dirCtx: node.handle.id, targetPath };
     }
-
-    // ── CRUD ──────────────────────────────────────────────
-    /** Drive API equivalent of original FSA method – creates new file in Drive */
     async createFile(name, dirCtx) {
-        const resp = await this.#api.uploadMultipart(
-            `${DriveAdapter.UPLOAD_API}/files?uploadType=multipart&fields=id,name`,
-            'POST', { name, parents: [dirCtx] }, ''
-        );
+        const resp = await this.#api.up(`${DriveAdapter.UPLOAD_API}/files?uploadType=multipart&fields=id,name`, 'POST', { name, parents: [dirCtx] }, '');
         if (!resp.ok) throw new Error(`Create file failed: ${resp.status}`);
         const data = await resp.json();
         return this.#api.makeHandle(data.id, data.name, 'file');
     }
-
-    /** Drive API equivalent of original FSA method – creates new folder in Drive */
     async createFolder(name, dirCtx) {
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, mimeType: DriveAdapter.FOLDER_MIME, parents: [dirCtx] }),
         });
         if (!resp.ok) throw new Error(`Create folder failed: ${resp.status}`);
         const data = await resp.json();
         return this.#api.makeHandle(data.id, data.name, 'directory');
     }
-
-    /** Drive API equivalent of original FSA method – lists root names for untitled file creation */
     async listRootNames(rootHandle) {
         const names = new Set();
         const q = encodeURIComponent(`'${rootHandle.id}' in parents and trashed=false`);
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(name)&pageSize=1000`);
-        if (resp.ok) {
-            const data = await resp.json();
-            for (const f of (data.files || [])) names.add(f.name);
-        }
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(name)&pageSize=1000`);
+        if (resp.ok) { const data = await resp.json(); for (const f of (data.files || [])) names.add(f.name); }
         return names;
     }
-
-    /** Drive API equivalent of original FSA method – updates file content in Drive via multipart PATCH */
     async writeFile(handle, content) {
-        const resp = await this.#api.uploadMultipart(
-            `${DriveAdapter.UPLOAD_API}/files/${handle.id}?uploadType=multipart`,
-            'PATCH', {}, content
-        );
+        const resp = await this.#api.up(`${DriveAdapter.UPLOAD_API}/files/${handle.id}?uploadType=multipart`, 'PATCH', {}, content);
         if (!resp.ok) throw new Error(`Save failed: ${resp.status}`);
     }
-
-    /** Drive API equivalent of original FSA method – deletes file via Drive files.delete */
     async deleteFileEntry(target, rootHandle) {
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${target.handle.id}`, { method: 'DELETE' });
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${target.handle.id}`, { method: 'DELETE' });
         if (!resp.ok && resp.status !== 204) throw new Error(`Delete failed: ${resp.status}`);
     }
-
-    /** Drive API equivalent of original FSA method – deletes folder via Drive files.delete (same REST call as deleteFileEntry) */
     async deleteFolderEntry(target, rootHandle) { return this.deleteFileEntry(target, rootHandle); }
-
-    /** Drive API equivalent of original FSA method – renames file/folder via Drive files.update */
     async renameEntry(target, newName, rootHandle) {
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${target.handle.id}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${target.handle.id}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name: newName }),
         });
         if (!resp.ok) throw new Error(`Rename failed: ${resp.status}`);
@@ -1371,34 +1191,27 @@ class DriveAdapter extends StorageAdapter {
         const newPath = target.path.replace(/[^/]+$/, newName);
         return { updatedHandle, newPath };
     }
-
     async existsInDir(destNode, name) {
         const q = encodeURIComponent(`'${destNode.handle.id}' in parents and name='${name.replace(/'/g, "\\'")}' and trashed=false`);
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(id)&pageSize=1`);
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files?q=${q}&fields=files(id)&pageSize=1`);
         if (!resp.ok) return false;
         const data = await resp.json();
         return (data.files?.length > 0);
     }
-
-    /** Drive API equivalent of original FSA method – moves file/folder via Drive files.update with addParents/removeParents */
     async moveEntryImpl(srcNode, destNode, rootHandle) {
-        const parentResp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${srcNode.handle.id}?fields=parents`);
-        if (!parentResp.ok) throw new Error(`Move failed: ${parentResp.status}`);
-        const parentData = await parentResp.json();
-        const previousParents = (parentData.parents || []).join(',');
-        const resp = await this.#api.driveRequest(
+        const pr = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${srcNode.handle.id}?fields=parents`);
+        if (!pr.ok) throw new Error(`Move failed: ${pr.status}`);
+        const previousParents = ((await pr.json()).parents || []).join(',');
+        const resp = await this.#api.dr(
             `${DriveAdapter.DRIVE_API}/files/${srcNode.handle.id}?addParents=${destNode.handle.id}&removeParents=${previousParents}`,
             { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{}' }
         );
         if (!resp.ok) throw new Error(`Move failed: ${resp.status}`);
     }
-
-    /** Drive API equivalent of original FSA method – copies file/folder via Drive files.copy */
     async copyEntryImpl(srcNode, destNode) {
         if (srcNode.kind === 'file') {
-            const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${srcNode.handle.id}/copy`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+            const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${srcNode.handle.id}/copy`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: srcNode.name, parents: [destNode.handle.id] }),
             });
             if (!resp.ok) throw new Error(`Copy failed: ${resp.status}`);
@@ -1406,41 +1219,7 @@ class DriveAdapter extends StorageAdapter {
             await this.#api.copyDirectory(srcNode.handle.id, destNode.handle.id, srcNode.name);
         }
     }
-
-    /** Drive API equivalent of original FSA method – compares Drive file IDs */
     async isSameEntry(h1, h2) { return !!h1 && !!h2 && h1.id === h2.id; }
-
-    // ── Messages ──────────────────────────────────────────
-    formatError(action, e) {
-        if (e.message?.includes('permission') || e.message?.includes('403')) return `${action} failed: permission denied – reconnect Google account`;
-        if (e.message?.includes('quota') || e.message?.includes('429')) return `${action} failed: rate limit exceeded, try again`;
-        if (e.message?.includes('404') || e.message?.includes('not found')) return `${action} failed: file/folder not found`;
-        return `${action} failed: ${e.message || e}`;
-    }
-    isAbortError(e) { return e.message === 'popup_closed_by_user'; }
-    get notConnectedMsg() { return 'Connect Google Account first'; }
-    get connectSuccessMsg() { return 'Google Drive connected ✓'; }
-    get connectionFailedMsg() { return 'Google Drive connection cancelled or failed'; }
-    get permissionDeniedMsg() { return 'Reconnect Google account to grant access'; }
-    getReadErrorMsg(e) {
-        return (e.message.includes('permission') || e.message.includes('403'))
-            ? 'Reconnect Google account to grant access'
-            : 'File too large or unreadable as text';
-    }
-    getSaveErrorMsg(err) {
-        return err.message.includes('403') ? 'Reconnect Google account' : 'Save failed';
-    }
-    showPendingAuthToast(ui, handle, onSuccess) {
-        ui.showActionToast('Tap to reconnect Google Account', async () => {
-            try {
-                await this.#ensureToken();
-                await onSuccess(handle);
-                ui.showToast('Google Drive access restored ✓');
-            } catch {
-                ui.showToast('Failed to restore access');
-            }
-        }, 15000);
-    }
 }
 // ────────────────────────────────────────────────────────
 // FileManager – high-level storage orchestration
