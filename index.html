@@ -1540,7 +1540,6 @@ class FileManager {
             tab.dirty = false;
             if (tab.element) tab.element.querySelector('.dirty-indicator').style.visibility = 'hidden';
             this.#ui.updateEditorStatus(tab);
-            this.#ui.showToast('Saved', 1200);
         } catch (err) {
             this.#ui.showToast(this.adapter.getSaveErrorMsg(err));
         }
