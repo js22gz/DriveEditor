@@ -43,7 +43,8 @@ window.LEGEND = `<!--
                   │
                   ├── ReactiveState – Proxy<EventTarget>
                   │     • currentDirHandle, tabs[], currentTabId,
-                  │       expandedFolders, activeFilePath, activeDirectoryPath,
+                  │       expandedFolders, activeFilePath,
+                  │       activeDirectoryPaths {left,right}, lastActivePane,
                   │       copiedNode
                   │     • getTab() / getActiveTab()
                   │     • auto-dispatches <prop>Changed events
@@ -587,7 +588,8 @@ class ReactiveState extends EventTarget {
         this.currentTabId = null;
         this.expandedFolders = new Set();
         this.activeFilePath = null;
-        this.activeDirectoryPath = null;
+        this.activeDirectoryPaths = { left: null, right: null };
+        this.lastActivePane = 'left';
         this.copiedNode = null;
         return new Proxy(this, {
             get(target, prop) {
@@ -612,6 +614,10 @@ class ReactiveState extends EventTarget {
     }
     getTab(id) { return this.tabs.find(t => t.id === id); }
     getActiveTab() { return this.currentTabId !== null ? this.getTab(this.currentTabId) : null; }
+    setActiveDir(pane, path) {
+        this.mutate('activeDirectoryPaths', m => { m[pane] = path; });
+        this.lastActivePane = pane;
+    }
 }
 // ────────────────────────────────────────────────────────
 // PathUtils – file-path helpers
@@ -1294,10 +1300,11 @@ class FileManager {
     async clearSavedFolder() {
         await this.adapter.clearSessionData();
         this.state.currentDirHandle = null;
-        this.state.activeDirectoryPath = null;
+        this.state.activeDirectoryPaths = { left: null, right: null };
         this.state.expandedFolders.clear();
         localStorage.removeItem('expandedFolders');
         localStorage.removeItem('openTabs');
+        localStorage.removeItem('activeDirectoryPaths');
         this.tree.clear();
         this.tree.updateHeader();
     }
@@ -1365,9 +1372,19 @@ class FileManager {
             const saved = localStorage.getItem('expandedFolders');
             if (saved) this.state.expandedFolders = new Set(JSON.parse(saved));
         } catch {}
+        try {
+            const savedDirs = localStorage.getItem('activeDirectoryPaths');
+            if (savedDirs) {
+                const parsed = JSON.parse(savedDirs);
+                if (parsed && typeof parsed === 'object' && 'left' in parsed && 'right' in parsed) {
+                    this.state.activeDirectoryPaths = parsed;
+                }
+            }
+        } catch {}
     }
     saveExpandedState() {
         try { localStorage.setItem('expandedFolders', JSON.stringify([...this.state.expandedFolders])); } catch {}
+        try { localStorage.setItem('activeDirectoryPaths', JSON.stringify(this.state.activeDirectoryPaths)); } catch {}
     }
     saveOpenTabs(currentId) {
         try {
@@ -1447,7 +1464,7 @@ class FileManager {
             this.state.currentDirHandle = rootHandle;
             await this.saveFolderHandle(rootHandle);
             this.state.expandedFolders.clear();
-            this.state.activeDirectoryPath = null;
+            this.state.activeDirectoryPaths = { left: null, right: null };
             await this.build(rootHandle);
             this.tree.render();
             this.tree.updateHeader();
@@ -1496,7 +1513,7 @@ class FileManager {
     async #getTargetDir() {
         return this.adapter.resolveTargetDir(
             this.#ui.contextMenuTarget,
-            this.state.activeDirectoryPath,
+            this.state.activeDirectoryPaths[this.state.lastActivePane],
             this.state.currentDirHandle,
             path => this.tree.getNode(path)
         );
@@ -1522,7 +1539,7 @@ class FileManager {
     async #newItem(kind) {
         if (!this.state.currentDirHandle) return this.#ui.showToast(this.adapter.notConnectedMsg);
         const isFile = kind === 'file';
-        const activePath = this.state.activeDirectoryPath || '';
+        const activePath = this.state.activeDirectoryPaths[this.state.lastActivePane] || '';
         const rootName = this.state.currentDirHandle.name;
         const displayPath = '/' + rootName + (activePath ? '/' + activePath : '') + '/';
         const name = await this.#ui.showDialog({ promptTitle: isFile ? 'New file name:' : 'New folder name:', subtitle: displayPath });
@@ -1729,7 +1746,7 @@ class DirectoryTreeView {
         this.rootDirNameEl = null;
         this.sidebarHeaderActionsEl = null;
         this.state.addEventListener('activeFilePathChanged', () => this.highlightActive());
-        this.state.addEventListener('activeDirectoryPathChanged', () => this.highlightActive());
+        this.state.addEventListener('activeDirectoryPathsChanged', () => this.highlightActive());
     }
     get fs() { return this.#fs; }
     set fs(v) { if (this.#fs === v) return; this.#fs = v; for (const lv of this.#linkedViews) lv.fs = v; }
@@ -1800,8 +1817,8 @@ class DirectoryTreeView {
                     this.state.mutate('expandedFolders', s => s.add(node.path));
                     childrenDiv.style.display = 'block';
                 }
+                this.state.setActiveDir(this.paneName, node.path);
                 this.fs.saveExpandedState();
-                this.state.activeDirectoryPath = node.path;
                 this.updateHeader();
             };
 
@@ -1883,8 +1900,9 @@ class DirectoryTreeView {
             const el = this.container.querySelector(`.tree-row[data-path="${CSS.escape(this.state.activeFilePath)}"]`);
             if (el) el.classList.add('active');
         }
-        if (this.state.activeDirectoryPath) {
-            const dirEl = this.container.querySelector(`.tree-row[data-path="${CSS.escape(this.state.activeDirectoryPath)}"]`);
+        const dirPath = this.state.activeDirectoryPaths?.[this.paneName];
+        if (dirPath) {
+            const dirEl = this.container.querySelector(`.tree-row[data-path="${CSS.escape(dirPath)}"]`);
             if (dirEl) dirEl.classList.add('active-dir');
         }
     }
@@ -2594,16 +2612,17 @@ class UIManager {
             this.#bindTreeContainerEvents(this.#treeContainerRight, this.#treeRight);
         }
     }
-    #showTreeContextMenu(e, target) {
+    #showTreeContextMenu(e, target, treeView) {
         const row = target.closest('.tree-row');
+        const pane = treeView?.paneName || 'left';
         if (row && row.dataset.path) {
             const node = this.tree.getNode(row.dataset.path);
             if (node) {
-                this.state.activeDirectoryPath = this.#parentDirPath(node);
+                this.state.setActiveDir(pane, this.#parentDirPath(node));
                 this.showContextMenu(e, node);
             }
         } else {
-            this.state.activeDirectoryPath = null;
+            this.state.setActiveDir(pane, null);
             this.showContextMenu(e, null);
         }
     }
@@ -2640,7 +2659,7 @@ class UIManager {
                     this.tabs.createNewTab(null, 'legend.txt', window.LEGEND, null, 'legend');
                 }
             });
-            if (this.state.copiedNode) { addSeparator(); addItem('Paste', () => this.fs.copyEntry(this.state.copiedNode, this.state.activeDirectoryPath || '')); }
+            if (this.state.copiedNode) { addSeparator(); addItem('Paste', () => this.fs.copyEntry(this.state.copiedNode, this.state.activeDirectoryPaths[this.state.lastActivePane] || '')); }
         } else if (node.kind === 'directory') {
             addItem('New File', () => this.fs.newFile());
             addItem('New Folder', () => this.fs.newFolder());
@@ -2807,7 +2826,9 @@ class UIManager {
     }
     #bindTreeContainerEvents(container, treeView) {
         container.addEventListener('click', e => {
-            if (!e.target.closest('.tree-row')) this.state.activeDirectoryPath = null;
+            if (!e.target.closest('.tree-row')) {
+                this.state.setActiveDir(treeView.paneName, null);
+            }
         });
         container.addEventListener('dragover', e => {
             if (!e.dataTransfer.types.includes('application/x-tree-path')) return;
@@ -2825,7 +2846,7 @@ class UIManager {
             if (srcPath) this.fs.moveEntry(srcPath, '');
         });
         container.addEventListener('contextmenu', e => {
-            this.#showTreeContextMenu(e, e.target);
+            this.#showTreeContextMenu(e, e.target, treeView);
         });
         let longPressTimer = null;
         let touchMoved = false;
@@ -2837,7 +2858,7 @@ class UIManager {
             longPressTimer = setTimeout(() => {
                 treeView.longPressTriggered = true;
                 const fakeEvent = { preventDefault() {}, clientX: touch.clientX, clientY: touch.clientY };
-                this.#showTreeContextMenu(fakeEvent, target);
+                this.#showTreeContextMenu(fakeEvent, target, treeView);
             }, 600);
         }, { passive: true });
         container.addEventListener('touchend', e => {
@@ -3055,6 +3076,7 @@ class UIManager {
         }
         if (this.state.currentDirHandle) {
             this.fs.saveOpenTabs(this.state.currentTabId);
+            this.fs.saveExpandedState();
         }
         this.fs.flushSave().catch(e => console.warn('Flush during snapshot failed', e));
     }
@@ -3257,10 +3279,11 @@ class EditorApp {
         this.state.tabs = [];
         this.state.currentTabId = null;
         this.state.currentDirHandle = null;
-        this.state.activeDirectoryPath = null;
+        this.state.activeDirectoryPaths = { left: null, right: null };
         this.state.expandedFolders.clear();
         localStorage.removeItem('expandedFolders');
         localStorage.removeItem('openTabs');
+        localStorage.removeItem('activeDirectoryPaths');
         this.tree.clear();
         this.tree.updateHeader();
         try {
