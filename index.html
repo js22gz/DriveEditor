@@ -563,7 +563,7 @@ class ReactiveState extends EventTarget {
         fn(this[prop]);
         this.dispatchEvent(new CustomEvent(prop + 'Changed'));
     }
-        notify(prop) {
+    notify(prop) {
         this.dispatchEvent(new CustomEvent(prop + 'Changed'));
     }
     getTab(id) { return this.tabs.find(t => t.id === id); }
@@ -1033,6 +1033,8 @@ class DriveAdapter extends StorageAdapter {
         handle.isSameEntry = (other) => other?.id === id;
         return handle;
     }
+    /** Public wrapper used by TabManager.restoreOpenTabs to reconstruct a file handle from a saved Drive file ID */
+    makeFileHandle(id, name) { return this.#makeHandle(id, name, 'file'); }
 
     /** Internal: finds a child entry in a Drive folder by name and kind (used by fake handles) */
     async _findChild(parentId, childName, kind, opts) {
@@ -1201,18 +1203,9 @@ class DriveAdapter extends StorageAdapter {
     /** Drive API equivalent of original FSA method – connects Google account and sets root to My Drive */
     async connectRoot() {
         await this.#ensureToken();
-const resp = await this.#driveRequest(`${DriveAdapter.DRIVE_API}/files/root?fields=id,name`);
-if (!resp.ok) {
-    const errorText = await resp.text();
-    console.error('=== GOOGLE DRIVE ROOT 403 DEBUG ===', {
-        status: resp.status,
-        statusText: resp.statusText,
-        body: errorText,
-        url: resp.url
-    });
-    throw new Error(`Root failed: ${resp.status} — ${errorText}`);
-}
-const rootInfo = await resp.json();
+        const resp = await this.#driveRequest(`${DriveAdapter.DRIVE_API}/files/root?fields=id,name`);
+        if (!resp.ok) throw new Error(`Root failed: ${resp.status}`);
+        const rootInfo = await resp.json();
         return this.#makeHandle(rootInfo.id, 'My Drive', 'directory');
     }
 
@@ -2540,37 +2533,34 @@ class TabManager {
         }
         this.switchToTab(this.state.tabs[Math.min(idx, this.state.tabs.length - 1)].id);
     }
-async restoreOpenTabs(savedHandle, savedTabs = this.fs.loadOpenTabs()) {
-    let restored = 0;
-    let activeTabPath = null;
-
-    for (const st of savedTabs) {
-        try {
-            // Try to restore using path (legacy FSA) or storageId (new Drive)
-            let fileHandle;
-            if (st.storageId) {
-                // Drive case: reconstruct fake handle from id
-                fileHandle = await this.fs.adapter.#makeHandle(st.storageId, st.name, 'file');
-            } else if (st.path) {
-                // Legacy FSA path traversal
-                const parts = st.path.split('/').filter(Boolean);
-                let current = savedHandle;
-                for (let i = 0; i < parts.length - 1; i++) {
-                    current = await current.getDirectoryHandle(parts[i]);
-                }
-                fileHandle = await current.getFileHandle(parts[parts.length - 1]);
-            } else continue;
-
-            const file = await fileHandle.getFile();
-            const content = await file.text();
-            await this.createNewTab(fileHandle, st.name, content, st.path, st.type || 'text');
-            if (st.active) activeTabPath = st.path;
-            restored++;
-        } catch (e) {
-            console.warn(`Failed to restore tab ${st.name || st.path}`, e);
+    async restoreOpenTabs(savedHandle, savedTabs = this.fs.loadOpenTabs()) {
+        let restored = 0;
+        let activeTabPath = null;
+        for (const st of savedTabs) {
+            try {
+                let fileHandle;
+                if (st.storageId) {
+                    // Drive: reconstruct handle from saved file ID
+                    fileHandle = this.fs.adapter.makeFileHandle(st.storageId, st.name);
+                } else if (st.path) {
+                    // Local FSA: traverse path from root handle
+                    const parts = st.path.split('/').filter(Boolean);
+                    let current = savedHandle;
+                    for (let i = 0; i < parts.length - 1; i++) {
+                        current = await current.getDirectoryHandle(parts[i]);
+                    }
+                    fileHandle = await current.getFileHandle(parts[parts.length - 1]);
+                } else continue;
+                const file = await fileHandle.getFile();
+                const content = await file.text();
+                await this.createNewTab(fileHandle, st.name, content, st.path, st.type || 'text');
+                if (st.active) activeTabPath = st.path;
+                restored++;
+            } catch (e) {
+                console.warn(`Failed to restore tab ${st.name || st.path}`, e);
+            }
         }
-    }
-	if (activeTabPath) {
+        if (activeTabPath) {
             const activeTab = this.state.tabs.find(t => t.path === activeTabPath);
             if (activeTab) this.switchToTab(activeTab.id);
         } else if (this.state.tabs.length > 0) {
