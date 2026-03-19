@@ -667,8 +667,14 @@ class LocalAdapter extends StorageAdapter {
         await writable.close();
     }
     async #entryExists(dirHandle, name) {
-        try { await dirHandle.getFileHandle(name); return true; } catch (e) { if (e.name !== 'NotFoundError') throw e; }
-        try { await dirHandle.getDirectoryHandle(name); return true; } catch (e) { if (e.name !== 'NotFoundError') throw e; }
+        try {
+            await dirHandle.getFileHandle(name);
+            return true;
+        } catch (e) { if (e.name !== 'NotFoundError') throw e; }
+        try {
+            await dirHandle.getDirectoryHandle(name);
+            return true;
+        } catch (e) { if (e.name !== 'NotFoundError') throw e; }
         return false;
     }
     // ── Auth / Permissions ────────────────────────────────
@@ -1566,7 +1572,7 @@ class FileManager {
         try {
             const data = this.state.tabs
                 .filter(t => t.path)
-                .map(t => ({ path: t.path, name: t.name, type: t.type, active: t.id === currentId, driveId: t.handle?.id }));
+                .map(t => ({ path: t.path, name: t.name, type: t.type, active: t.id === currentId, storageId: t.handle?.id }));
             if (data.length || this.state.currentDirHandle) {
                 localStorage.setItem('openTabs', JSON.stringify(data));
             }
@@ -1928,7 +1934,7 @@ class FileManager {
 class TreeManager {
     #fileTree = null;
     #nodeByPath = new Map();
-    /** @param {ReactiveState} state @param {FileSystemManager} fs */
+    /** @param {ReactiveState} state @param {FileManager} fs */
     constructor(state, fs) {
         this.state = state;
         this.fs = fs;
@@ -2113,7 +2119,7 @@ class TreeManager {
 // ────────────────────────────────────────────────────────
 class ExtensionManager {
     extensions = [];
-    /** @param {ReactiveState} state @param {FileSystemManager} fs */
+    /** @param {ReactiveState} state @param {FileManager} fs */
     constructor(state, fs) {
         this.state = state;
         this.fs = fs;
@@ -2248,7 +2254,7 @@ class TabManager {
     /** Returns true when a tab of the given type can be marked dirty/modified */
     static canTabBeDirty(type) { return TabManager.#TAB_TYPES[type]?.canDirty ?? false; }
     #nextTabId = 1;
-    /** @param {ReactiveState} state @param {FileSystemManager} fs @param {ExtensionManager} extensions */
+    /** @param {ReactiveState} state @param {FileManager} fs @param {ExtensionManager} extensions */
     constructor(state, fs, extensions) {
         this.state = state;
         this.fs = fs;
@@ -2584,7 +2590,7 @@ class UIManager {
     #wakeRestoring = false;
     #lastHiddenAt = 0;
     #wakeRetryTimer = null;
-	    /** @param {ReactiveState} state @param {TabManager} tabs @param {TreeManager} tree @param {FileSystemManager} fs @param {ExtensionManager} extensions */
+	    /** @param {ReactiveState} state @param {TabManager} tabs @param {TreeManager} tree @param {FileManager} fs @param {ExtensionManager} extensions */
     constructor(state, tabs, tree, fs, extensions) {
         this.state = state;
         this.tabs = tabs;
