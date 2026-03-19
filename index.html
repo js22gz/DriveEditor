@@ -2939,7 +2939,17 @@ class UIManager {
             document.body.appendChild(modal);
             input.focus();
             const confirm = () => {
-                if (!selectedKind || !input.value.trim()) return;
+                if (!selectedKind) {
+                    fileBtn.style.borderColor = dirBtn.style.borderColor = '#ef4444';
+                    setTimeout(() => { fileBtn.style.borderColor = dirBtn.style.borderColor = '#3f3f46'; }, 800);
+                    return;
+                }
+                if (!input.value.trim()) {
+                    input.style.borderColor = '#ef4444';
+                    input.focus();
+                    setTimeout(() => { input.style.borderColor = '#3f3f46'; }, 800);
+                    return;
+                }
                 resolve({ kind: selectedKind, name: input.value.trim() });
                 modal.remove();
             };
@@ -3272,7 +3282,7 @@ class UIManager {
             if (raw >= MAX_CHARS) return MAX_CHARS;
             if (!mobileQuery.matches) return raw;
             /* Exponential curve for mobile: spreads lower char values across most of the slider range */
-            const t = (raw - MIN_CHARS) / (MAX_CHARS - MIN_CHARS); /* 0 → 1 */
+            const t = (raw - MIN_CHARS) / (MAX_CHARS - MIN_CHARS); /* 0 → ~1 (MAX_CHARS returns early above) */
             return Math.round(MIN_CHARS + (MAX_CHARS - MIN_CHARS) * (t * t));
         };
         slider.addEventListener('input', e => {
