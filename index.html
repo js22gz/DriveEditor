@@ -78,12 +78,9 @@ window.LEGEND = `<!--
                   │     • #newItem() shared helper (newFile / newFolder)
                   │     • Session restore (pageshow / visibilitychange in bindLifecycle)
                   │
-                  ├── TreeRenderer – pure DOM row builder
-                  │     • render(node, container, guides, isLast) → row element
-                  │
                   ├── TreeManager
                   │     • nodeByPath Map + fileTree root
-                  │     • uses TreeRenderer for row DOM creation
+                  │     • #renderTree inlines DOM row creation (formerly TreeRenderer)
                   │     • Drag & drop 
                   │     • highlightActive() + updateHeader()
                   │     • registerNode / getNode / clear
@@ -105,7 +102,8 @@ window.LEGEND = `<!--
                   │
                   ├── UIManager
                   │     • DOM wiring, context menu, long-press (mobile)
-                  │     • showToast / showDialog / updateLineNumbers
+                  │     • showToast / showDialog / showCreateDialog / updateLineNumbers
+                  │     • #showModal() shared modal scaffold helper
                   │     • bindKeyboard() · bindTreeEvents() · bindTabEvents()
                   │       bindSettings() · bindLifecycle()
                   │     • #bindTextarea() · #bindSlider() · #bindSettingsPopover()
@@ -1681,25 +1679,33 @@ class FileManager {
 }
 
 // ────────────────────────────────────────────────────────
-// TreeRenderer – pure DOM row builder (guide lines + labels, no events)
-// TreeManager calls renderer.render() then attaches events to the returned row.
+// TreeManager – file tree data + DOM rendering (TREE.html structure + Unicode magic)
 // ────────────────────────────────────────────────────────
-class TreeRenderer {
-    /**
-     * Creates and appends a single tree row to container.
-     * @param {object} node  – tree node ({kind, name, path})
-     * @param {Element} container – DOM element to append into
-     * @param {boolean[]} guides  – one boolean per ancestor: true = draw vertical line
-     * @param {boolean} isLast   – whether this node is the last child at its level
-     * @returns {Element} the created row element
-     */
-    render(node, container, guides = [], isLast = true) {
+class TreeManager {
+    #fileTree = null;
+    #nodeByPath = new Map();
+    /** @param {ReactiveState} state @param {FileManager} fs */
+    constructor(state, fs) {
+        this.state = state;
+        this.fs = fs;
+        this.longPressTriggered = false;
+        this.treeContainer = null;
+        this.rootDirNameEl = null;
+        this.sidebarHeaderActionsEl = null;
+        this.state.addEventListener('activeFilePathChanged', () => this.highlightActive());
+        this.state.addEventListener('activeDirectoryPathChanged', () => this.highlightActive());
+    }
+    get fileTree() { return this.#fileTree; }
+    set fileTree(v) { this.#fileTree = v; }
+    getNode(path) { return this.#nodeByPath.get(path); }
+    registerNode(path, node) { this.#nodeByPath.set(path, node); }
+
+    #renderTree(node, container, guides = [], isLast = true) {
         const isDir = node.kind === 'directory';
         const row = document.createElement('div');
         row.className = `tree-row ${isDir ? 'dir-row' : ''}`;
         row.dataset.path = node.path;
 
-        // Build prefix span with CSS guide lines
         const prefixEl = document.createElement('span');
         prefixEl.className = 'prefix';
         prefixEl.textContent = ' '.repeat((guides.length + 1) * 5);
@@ -1718,49 +1724,16 @@ class TreeRenderer {
             prefixEl.appendChild(c);
         }
         row.appendChild(prefixEl);
-
         if (!isDir) {
             const square = document.createElement('span');
             square.className = 'file-square';
             row.appendChild(square);
         }
-
         const nameEl = document.createElement('span');
         nameEl.className = isDir ? 'name dir' : 'name file-name';
         nameEl.textContent = node.name + (isDir ? '/' : '');
         row.appendChild(nameEl);
-
         container.appendChild(row);
-        return row;
-    }
-}
-// ────────────────────────────────────────────────────────
-// TreeManager – file tree data + DOM rendering (TREE.html structure + Unicode magic)
-// ────────────────────────────────────────────────────────
-class TreeManager {
-    #fileTree = null;
-    #nodeByPath = new Map();
-    #renderer = new TreeRenderer();
-    /** @param {ReactiveState} state @param {FileManager} fs */
-    constructor(state, fs) {
-        this.state = state;
-        this.fs = fs;
-        this.longPressTriggered = false;
-        this.treeContainer = null;
-        this.rootDirNameEl = null;
-        this.sidebarHeaderActionsEl = null;
-        this.state.addEventListener('activeFilePathChanged', () => this.highlightActive());
-        this.state.addEventListener('activeDirectoryPathChanged', () => this.highlightActive());
-    }
-    get fileTree() { return this.#fileTree; }
-    set fileTree(v) { this.#fileTree = v; }
-    getNode(path) { return this.#nodeByPath.get(path); }
-    registerNode(path, node) { this.#nodeByPath.set(path, node); }
-
-    #renderTree(node, container, guides = [], isLast = true) {
-        // Delegate DOM row creation to TreeRenderer; add events below
-        const row = this.#renderer.render(node, container, guides, isLast);
-        const isDir = node.kind === 'directory';
 
         if (isDir) {
             const childrenDiv = document.createElement('div');
@@ -2434,26 +2407,36 @@ class UIManager {
         t.addEventListener('click', () => { clearTimeout(timer); t.remove(); callback(); });
         document.body.appendChild(t);
     }
+    /** Shared modal scaffold. Builds an overlay, appends it, returns {modal, card, okBtn, cancelBtn}.
+     *  The innerHTML must include buttons with data-role="ok" and data-role="cancel". */
+    #showModal(innerHTML) {
+        const modal = document.createElement('div');
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;z-index:10001;';
+        modal.innerHTML = innerHTML;
+        document.body.appendChild(modal);
+        const card = modal.firstElementChild;
+        const okBtn = card.querySelector('[data-role="ok"]');
+        const cancelBtn = card.querySelector('[data-role="cancel"]');
+        return { modal, card, okBtn, cancelBtn };
+    }
     showDialog({promptTitle, subtitle = '', defaultValue = '', isConfirm = false, confirmMessage = '', danger = false} = {}) {
         return new Promise(resolve => {
-            const modal = document.createElement('div');
-            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;z-index:10001;';
             const okBg = danger ? '#ef4444' : '#a1a1aa', okFg = danger ? '#fff' : '#09090b';
-            modal.innerHTML = `<div style="background:#18181b;padding:24px;border-radius:8px;min-width:320px;border:1px solid #27272a;">` +
+            const { modal, card, okBtn, cancelBtn } = this.#showModal(
+                `<div style="background:#18181b;padding:24px;border-radius:8px;min-width:320px;border:1px solid #27272a;">` +
                 `<div style="margin-bottom:12px;font-size:14px;"></div>` +
                 `<div style="margin-bottom:12px;font-size:12px;color:#71717a;word-break:break-all;"></div>` +
                 (!isConfirm ? `<input type="text" style="width:100%;padding:10px;background:#27272a;border:1px solid #3f3f46;color:#e4e4e7;border-radius:4px;font-size:16px;">` : '') +
                 `<div style="display:flex;gap:8px;margin-top:16px;">` +
-                `<button style="flex:1;min-height:44px;background:${okBg};color:${okFg};border:none;border-radius:4px;">${isConfirm ? 'Confirm' : 'OK'}</button>` +
-                `<button style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:none;border-radius:4px;">Cancel</button></div></div>`;
+                `<button data-role="ok" style="flex:1;min-height:44px;background:${okBg};color:${okFg};border:none;border-radius:4px;">${isConfirm ? 'Confirm' : 'OK'}</button>` +
+                `<button data-role="cancel" style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:none;border-radius:4px;">Cancel</button></div></div>`
+            );
             // textContent assignment keeps user-supplied strings free of HTML injection
-            modal.firstElementChild.firstElementChild.textContent = isConfirm ? confirmMessage : promptTitle;
-            const subtitleEl = modal.firstElementChild.children[1];
+            card.firstElementChild.textContent = isConfirm ? confirmMessage : promptTitle;
+            const subtitleEl = card.children[1];
             if (subtitle) { subtitleEl.textContent = subtitle; } else { subtitleEl.style.display = 'none'; }
             const input = modal.querySelector('input');
-            const [okBtn, cancelBtn] = modal.querySelectorAll('button');
             if (input) input.value = defaultValue;
-            document.body.appendChild(modal);
             const confirm = () => { resolve(isConfirm ? true : input.value); modal.remove(); };
             const cancel = () => { resolve(isConfirm ? false : null); modal.remove(); };
             if (input) {
@@ -2470,31 +2453,24 @@ class UIManager {
     }
     showCreateDialog() {
         return new Promise(resolve => {
-            const modal = document.createElement('div');
-            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;z-index:10001;';
             let selectedKind = null;
-            modal.innerHTML =
+            const { modal, okBtn, cancelBtn } = this.#showModal(
                 `<div style="background:#18181b;padding:24px;border-radius:8px;min-width:320px;border:1px solid #27272a;">` +
-                /* Layer 1 – title */
                 `<div style="text-align:center;margin-bottom:16px;"><h3 style="margin:0;font-size:16px;color:#e4e4e7;font-weight:600;">Create</h3></div>` +
-                /* Layer 2 – file / directory radio boxes */
                 `<div style="display:flex;gap:8px;margin-bottom:16px;" id="create-kind-row">` +
                 `<button data-kind="file" style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:4px;cursor:pointer;font-size:14px;">File</button>` +
                 `<button data-kind="directory" style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:4px;cursor:pointer;font-size:14px;">Directory</button>` +
                 `</div>` +
-                /* Layer 3 – filename input */
                 `<div style="margin-bottom:16px;">` +
                 `<input type="text" placeholder="Enter name…" style="width:100%;padding:10px;background:#27272a;border:1px solid #3f3f46;color:#e4e4e7;border-radius:4px;font-size:16px;box-sizing:border-box;">` +
                 `</div>` +
-                /* Layer 4 – OK / Cancel */
                 `<div style="display:flex;gap:8px;">` +
-                `<button style="flex:1;min-height:44px;background:#a1a1aa;color:#09090b;border:none;border-radius:4px;cursor:pointer;font-size:14px;">OK</button>` +
-                `<button style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:none;border-radius:4px;cursor:pointer;font-size:14px;">Cancel</button>` +
-                `</div></div>`;
+                `<button data-role="ok" style="flex:1;min-height:44px;background:#a1a1aa;color:#09090b;border:none;border-radius:4px;cursor:pointer;font-size:14px;">OK</button>` +
+                `<button data-role="cancel" style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:none;border-radius:4px;cursor:pointer;font-size:14px;">Cancel</button>` +
+                `</div></div>`
+            );
             const [fileBtn, dirBtn] = modal.querySelectorAll('#create-kind-row button');
             const input = modal.querySelector('input');
-            const container = modal.firstElementChild;
-            const [okBtn, cancelBtn] = container.lastElementChild.querySelectorAll('button');
             const selectKind = kind => {
                 selectedKind = kind;
                 fileBtn.style.background = kind === 'file' ? '#a1a1aa' : '#27272a';
@@ -2506,7 +2482,6 @@ class UIManager {
             };
             fileBtn.onclick = () => selectKind('file');
             dirBtn.onclick = () => selectKind('directory');
-            document.body.appendChild(modal);
             input.focus();
             const confirm = () => {
                 if (!selectedKind) {
