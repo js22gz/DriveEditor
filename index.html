@@ -26,7 +26,7 @@ window.LEGEND = `<!--
          ├── <main>
          │   ├── <aside id="sidebar">
          │   │   ├── #sidebar-header (ROOT: + ACTIVE: + refresh/clear)
-         │   │   └── #tree-container (lazy TreeManager)
+         │   │   └── #tree-container (lazy DirectoryTreeView)
          │   │
          │   ├── #sidebar-resize (draggable)
          │   └── .editor-area
@@ -78,7 +78,7 @@ window.LEGEND = `<!--
                   │     • #newItem() shared helper (newFile / newFolder)
                   │     • Session restore (pageshow / visibilitychange in bindLifecycle)
                   │
-                  ├── TreeManager
+                  ├── DirectoryTreeView
                   │     • nodeByPath Map + fileTree root
                   │     • #renderTree inlines DOM row creation (formerly TreeRenderer)
                   │     • Drag & drop 
@@ -196,19 +196,42 @@ header:fullscreen { display: none; }
   width: 280px; background: var(--bg-sidebar); border-right: 1px solid var(--border-color);
   display: flex; flex-direction: column; flex-shrink: 0;
   transition: width 0.2s, opacity 0.2s; overflow: hidden;
+  position: relative; /* anchor for .duplicate-sidebar-btn */
 }
 #sidebar.hidden { width: 0; border-right: none; opacity: 0; pointer-events: none; }
 
-#sidebar-header { padding: 0; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-subtle); border-bottom: 1px solid var(--border-color); }
+#sidebar-right {
+  width: 280px; background: var(--bg-sidebar); border-right: 1px solid var(--border-color);
+  display: flex; flex-direction: column; flex-shrink: 0;
+  transition: width 0.2s, opacity 0.2s; overflow: hidden;
+}
+#sidebar-right.hidden { width: 0; border-right: none; opacity: 0; pointer-events: none; }
+
+#sidebar-header, #sidebar-header-right { padding: 0; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-subtle); border-bottom: 1px solid var(--border-color); }
 .sidebar-header-row { padding: 8px 16px; cursor: pointer; display: flex; align-items: center; justify-content: space-between; color: var(--text-strong); }
 .sidebar-header-row:hover { color: var(--text-primary); }
 .sidebar-header-label { color: var(--text-dim); margin-right: 6px; }
 .directory-clear { cursor: pointer; margin-left: 8px; }
 
-#tree-container {
+#tree-container, #tree-container-right {
   flex: 1; overflow-y: auto; padding: 8px 12px 30px 8px;
   font-family: ui-monospace, monospace; font-size: 14px; line-height: 1.38; user-select: none;
 }
+
+#sidebar-resize-right {
+  width: 5px; cursor: col-resize; background: transparent; flex-shrink: 0;
+}
+#sidebar-resize-right:hover { background: var(--border-subtle); }
+#sidebar-resize-right.hidden { display: none; }
+
+.duplicate-sidebar-btn {
+  position: absolute; bottom: 4px; right: 4px;
+  background: none; border: 1px solid var(--border-color); color: var(--text-secondary);
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 2px 5px; border-radius: 4px;
+  transition: color 0.2s, background 0.2s; z-index: 5;
+}
+.duplicate-sidebar-btn:hover { background: var(--border-color); color: var(--text-primary); }
+.duplicate-sidebar-btn.active { color: var(--text-primary); background: var(--bg-active); }
 
 .tree-row {
   display: flex; align-items: center; padding: 6px 10px; border-radius: 3px;
@@ -243,7 +266,7 @@ header:fullscreen { display: none; }
 
 /* Drag & drop */
 .tree-row.dragging { opacity: 0.45; }
-.tree-row.drop-target, #tree-container.drop-target { background: var(--border-color); outline: 1px dashed var(--text-dim); }
+.tree-row.drop-target, #tree-container.drop-target, #tree-container-right.drop-target { background: var(--border-color); outline: 1px dashed var(--text-dim); }
 .children { display: block; }
 
 /* ────────────────────────────────────────────────────────
@@ -504,8 +527,19 @@ header:fullscreen { display: none; }
                 </div>
             </div>
             <div id="tree-container"></div>
+            <button id="duplicate-sidebar-toggle" class="duplicate-sidebar-btn" title="Duplicate sidebar">⎘</button>
         </aside>
         <div id="sidebar-resize"></div>
+        <aside id="sidebar-right" class="hidden">
+            <div id="sidebar-header-right">
+                <div id="sidebar-root-row-right" class="sidebar-header-row" title="Click to open folder">
+                    <span><span id="root-dir-name-right">Connect Google Account</span></span>
+                    <span id="sidebar-header-actions-right"></span>
+                </div>
+            </div>
+            <div id="tree-container-right"></div>
+        </aside>
+        <div id="sidebar-resize-right" class="hidden"></div>
         <div class="editor-area">
             <div id="tabs" class="hide-ext">
                 <div id="tab-settings-wrap">
@@ -1233,7 +1267,7 @@ class FileManager {
     constructor(state, adapter) {
         this.state = state;
         this.adapter = adapter;
-        /** @type {TreeManager} */ this.tree = null;
+        /** @type {DirectoryTreeView} */ this.tree = null;
         /** @type {TabManager} */ this.tabs = null;
         this.scheduleSave = (() => {
             let timer;
@@ -1678,24 +1712,31 @@ class FileManager {
 }
 
 // ────────────────────────────────────────────────────────
-// TreeManager – file tree data + DOM rendering (TREE.html structure + Unicode magic)
+// DirectoryTreeView – reusable file tree view + DOM rendering
 // ────────────────────────────────────────────────────────
-class TreeManager {
+class DirectoryTreeView {
     #fileTree = null;
     #nodeByPath = new Map();
-    /** @param {ReactiveState} state @param {FileManager} fs */
-    constructor(state, fs) {
+    #linkedViews = [];
+    #fs = null;
+    /** @param {string} containerId @param {ReactiveState} state @param {FileManager} fs @param {string} paneName */
+    constructor(containerId, state, fs, paneName = 'left') {
+        this.container = document.getElementById(containerId);
         this.state = state;
-        this.fs = fs;
+        this.#fs = fs;
+        this.paneName = paneName;
         this.longPressTriggered = false;
-        this.treeContainer = null;
         this.rootDirNameEl = null;
         this.sidebarHeaderActionsEl = null;
         this.state.addEventListener('activeFilePathChanged', () => this.highlightActive());
         this.state.addEventListener('activeDirectoryPathChanged', () => this.highlightActive());
     }
+    get fs() { return this.#fs; }
+    set fs(v) { if (this.#fs === v) return; this.#fs = v; for (const lv of this.#linkedViews) lv.fs = v; }
+    linkView(view) { this.#linkedViews.push(view); }
+    unlinkView(view) { this.#linkedViews = this.#linkedViews.filter(v => v !== view); }
     get fileTree() { return this.#fileTree; }
-    set fileTree(v) { this.#fileTree = v; }
+    set fileTree(v) { if (this.#fileTree === v) return; this.#fileTree = v; for (const lv of this.#linkedViews) lv.fileTree = v; }
     getNode(path) { return this.#nodeByPath.get(path); }
     registerNode(path, node) { this.#nodeByPath.set(path, node); }
 
@@ -1804,25 +1845,28 @@ class TreeManager {
     }
 
     render() {
-        this.treeContainer.replaceChildren();
+        this.container.replaceChildren();
         if (!this.#fileTree) {
             const msg = document.createElement('div');
             msg.style.cssText = 'padding:20px;color:#52525b;text-align:center;font-size:12px';
             msg.textContent = 'No folder open';
-            this.treeContainer.appendChild(msg);
+            this.container.appendChild(msg);
+            for (const lv of this.#linkedViews) lv.render();
             return;
         }
         const children = this.#fileTree.children || [];
         const lastDirIdx = children.reduce((acc, c, i) => c.kind === 'directory' ? i : acc, -1);
         children.forEach((child, i) => {
-            this.#renderTree(child, this.treeContainer, [], lastDirIdx < 0 || i >= lastDirIdx);
+            this.#renderTree(child, this.container, [], lastDirIdx < 0 || i >= lastDirIdx);
         });
         this.highlightActive();
+        for (const lv of this.#linkedViews) lv.render();
     }
     updateHeader() {
         if (!this.#fileTree || !this.state.currentDirHandle) {
             this.rootDirNameEl.textContent = 'Click to open folder';
             this.sidebarHeaderActionsEl.replaceChildren();
+            for (const lv of this.#linkedViews) lv.updateHeader();
             return;
         }
         const safeName = this.state.currentDirHandle.name;
@@ -1831,22 +1875,24 @@ class TreeManager {
             '<span class="directory-clear" id="add-new-item" title="Create new file or folder">+</span>' +
             '<span class="directory-clear" id="refresh-folder" title="Refresh tree">⟳</span>' +
             '<span class="directory-clear" id="clear-folder">⌫</span>';
+        for (const lv of this.#linkedViews) lv.updateHeader();
     }
     highlightActive() {
-        this.treeContainer.querySelectorAll('.tree-row.active,.tree-row.active-dir').forEach(el => el.classList.remove('active','active-dir'));
+        this.container.querySelectorAll('.tree-row.active,.tree-row.active-dir').forEach(el => el.classList.remove('active','active-dir'));
         if (this.state.activeFilePath) {
-            const el = this.treeContainer.querySelector(`.tree-row[data-path="${CSS.escape(this.state.activeFilePath)}"]`);
+            const el = this.container.querySelector(`.tree-row[data-path="${CSS.escape(this.state.activeFilePath)}"]`);
             if (el) el.classList.add('active');
         }
         if (this.state.activeDirectoryPath) {
-            const dirEl = this.treeContainer.querySelector(`.tree-row[data-path="${CSS.escape(this.state.activeDirectoryPath)}"]`);
+            const dirEl = this.container.querySelector(`.tree-row[data-path="${CSS.escape(this.state.activeDirectoryPath)}"]`);
             if (dirEl) dirEl.classList.add('active-dir');
         }
     }
     clear() {
         this.#fileTree = null;
         this.#nodeByPath.clear();
-        this.treeContainer.replaceChildren();
+        this.container.replaceChildren();
+        for (const lv of this.#linkedViews) lv.clear();
     }
 }
   
@@ -2318,6 +2364,10 @@ class UIManager {
     #rootDirNameEl = null;
     #sidebarHeaderActionsEl = null;
     #sidebarEl = null;
+    #sidebarRightEl = null;
+    #treeContainerRight = null;
+    #sidebarResizeRightEl = null;
+    #treeRight = null;
     #statusEl = null;
     #editorStatusEl = null;
     #contextMenu = null;
@@ -2329,7 +2379,7 @@ class UIManager {
     #wakeRestoring = false;
     #lastHiddenAt = 0;
     #wakeRetryTimer = null;
-	    /** @param {ReactiveState} state @param {TabManager} tabs @param {TreeManager} tree @param {FileManager} fs @param {ExtensionManager} extensions */
+	    /** @param {ReactiveState} state @param {TabManager} tabs @param {DirectoryTreeView} tree @param {FileManager} fs @param {ExtensionManager} extensions */
     constructor(state, tabs, tree, fs, extensions) {
         this.state = state;
         this.tabs = tabs;
@@ -2353,6 +2403,9 @@ class UIManager {
         this.#tabsContainer = document.getElementById('tabs');
         this.#treeContainer = document.getElementById('tree-container');
         this.#sidebarEl = document.getElementById('sidebar');
+        this.#sidebarRightEl = document.getElementById('sidebar-right');
+        this.#treeContainerRight = document.getElementById('tree-container-right');
+        this.#sidebarResizeRightEl = document.getElementById('sidebar-resize-right');
         if (this.#isMobile) this.#sidebarEl.classList.add('hidden');
         this.#statusEl = document.getElementById('status');
         this.#editorStatusEl = document.getElementById('editor-status');
@@ -2362,7 +2415,6 @@ class UIManager {
         this.tabs.textarea = this.#textarea;
         this.tabs.gutter = this.#gutter;
         this.tabs.tabsContainer = this.#tabsContainer;
-        this.tree.treeContainer = this.#treeContainer;
         this.tree.rootDirNameEl = this.#rootDirNameEl;
         this.tree.sidebarHeaderActionsEl = this.#sidebarHeaderActionsEl;
         const savedSidebarWidth = localStorage.getItem('sidebarWidth');
@@ -2514,6 +2566,34 @@ class UIManager {
         }
         document.getElementById('sidebar-toggle').textContent = hidden ? '›' : '‹';
     }
+    toggleDuplicateSidebar() {
+        const isOpen = !this.#sidebarRightEl.classList.contains('hidden');
+        if (isOpen) {
+            // Close the right pane
+            this.#sidebarRightEl.classList.add('hidden');
+            this.#sidebarResizeRightEl.classList.add('hidden');
+            document.getElementById('duplicate-sidebar-toggle').classList.remove('active');
+            if (this.#treeRight) {
+                this.tree.unlinkView(this.#treeRight);
+                this.#treeRight.clear();
+                this.#treeRight = null;
+            }
+        } else {
+            // Open the right pane
+            this.#treeRight = new DirectoryTreeView('tree-container-right', this.state, this.fs, 'right');
+            this.#treeRight.rootDirNameEl = document.getElementById('root-dir-name-right');
+            this.#treeRight.sidebarHeaderActionsEl = document.getElementById('sidebar-header-actions-right');
+            this.tree.linkView(this.#treeRight);
+            // Copy current file tree data so the right pane renders immediately
+            this.#treeRight.fileTree = this.tree.fileTree;
+            this.#sidebarRightEl.classList.remove('hidden');
+            this.#sidebarResizeRightEl.classList.remove('hidden');
+            document.getElementById('duplicate-sidebar-toggle').classList.add('active');
+            this.#treeRight.render();
+            this.#treeRight.updateHeader();
+            this.#bindTreeContainerEvents(this.#treeContainerRight, this.#treeRight);
+        }
+    }
     #showTreeContextMenu(e, target) {
         const row = target.closest('.tree-row');
         if (row && row.dataset.path) {
@@ -2651,12 +2731,17 @@ class UIManager {
     }
     bindTreeEvents() {
         document.getElementById('sidebar-toggle').addEventListener('click', () => this.toggleSidebar());
+        document.getElementById('duplicate-sidebar-toggle').addEventListener('click', () => this.toggleDuplicateSidebar());
         document.getElementById('sidebar-root-row').addEventListener('click', e => {
             if (e.target.id === 'refresh-folder' || e.target.id === 'clear-folder') return;
             this.fs.openFolder();
         });
+        document.getElementById('sidebar-root-row-right').addEventListener('click', e => {
+            if (e.target.id === 'refresh-folder' || e.target.id === 'clear-folder') return;
+            this.fs.openFolder();
+        });
 
-        // Sidebar resize
+        // Sidebar resize (left)
         const sidebarResizeHandle = document.getElementById('sidebar-resize');
         let sidebarResizing = false, sidebarResizeStartX = 0, sidebarResizeStartW = 0;
         sidebarResizeHandle.addEventListener('mousedown', e => {
@@ -2681,24 +2766,34 @@ class UIManager {
             document.body.style.userSelect = '';
             localStorage.setItem('sidebarWidth', this.#sidebarEl.offsetWidth + 'px');
         });
-        this.#treeContainer.addEventListener('click', e => {
-            if (!e.target.closest('.tree-row')) this.state.activeDirectoryPath = null;
-        });
-        this.#treeContainer.addEventListener('dragover', e => {
-            if (!e.dataTransfer.types.includes('application/x-tree-path')) return;
-            if (e.target.closest('.tree-row')) return;
+
+        // Sidebar resize (right)
+        let sidebarRightResizing = false, sidebarRightResizeStartX = 0, sidebarRightResizeStartW = 0;
+        this.#sidebarResizeRightEl.addEventListener('mousedown', e => {
+            sidebarRightResizing = true;
+            sidebarRightResizeStartX = e.clientX;
+            sidebarRightResizeStartW = this.#sidebarRightEl.offsetWidth;
+            this.#sidebarRightEl.style.transition = 'none';
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
             e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-            this.#treeContainer.classList.add('drop-target');
         });
-        this.#treeContainer.addEventListener('dragleave', () => this.#treeContainer.classList.remove('drop-target'));
-        this.#treeContainer.addEventListener('drop', e => {
-            this.#treeContainer.classList.remove('drop-target');
-            if (e.target.closest('.tree-row')) return;
-            e.preventDefault();
-            const srcPath = e.dataTransfer.getData('application/x-tree-path');
-            if (srcPath) this.fs.moveEntry(srcPath, '');
+        document.addEventListener('mousemove', e => {
+            if (!sidebarRightResizing) return;
+            const w = Math.max(150, Math.min(600, sidebarRightResizeStartW + e.clientX - sidebarRightResizeStartX));
+            this.#sidebarRightEl.style.width = w + 'px';
         });
+        document.addEventListener('mouseup', () => {
+            if (!sidebarRightResizing) return;
+            sidebarRightResizing = false;
+            this.#sidebarRightEl.style.transition = '';
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+        });
+
+        // Bind per-container tree events for the left pane
+        this.#bindTreeContainerEvents(this.#treeContainer, this.tree);
+
         document.addEventListener('click', e => {
             if (e.target.id === 'add-new-item') { e.stopPropagation(); this.fs.createFromDialog(); return; }
             if (e.target.id === 'clear-folder') { e.stopPropagation(); this.fs.clearSavedFolder(); return; }
@@ -2709,25 +2804,45 @@ class UIManager {
             }
             if (!e.target.closest('.context-menu')) this.closeContextMenu();
         });
-        this.#treeContainer.addEventListener('contextmenu', e => {
+    }
+    #bindTreeContainerEvents(container, treeView) {
+        container.addEventListener('click', e => {
+            if (!e.target.closest('.tree-row')) this.state.activeDirectoryPath = null;
+        });
+        container.addEventListener('dragover', e => {
+            if (!e.dataTransfer.types.includes('application/x-tree-path')) return;
+            if (e.target.closest('.tree-row')) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            container.classList.add('drop-target');
+        });
+        container.addEventListener('dragleave', () => container.classList.remove('drop-target'));
+        container.addEventListener('drop', e => {
+            container.classList.remove('drop-target');
+            if (e.target.closest('.tree-row')) return;
+            e.preventDefault();
+            const srcPath = e.dataTransfer.getData('application/x-tree-path');
+            if (srcPath) this.fs.moveEntry(srcPath, '');
+        });
+        container.addEventListener('contextmenu', e => {
             this.#showTreeContextMenu(e, e.target);
         });
         let longPressTimer = null;
         let touchMoved = false;
-        this.#treeContainer.addEventListener('touchstart', e => {
-            this.tree.longPressTriggered = false;
+        container.addEventListener('touchstart', e => {
+            treeView.longPressTriggered = false;
             touchMoved = false;
             const touch = e.touches[0];
             const target = e.target;
             longPressTimer = setTimeout(() => {
-                this.tree.longPressTriggered = true;
+                treeView.longPressTriggered = true;
                 const fakeEvent = { preventDefault() {}, clientX: touch.clientX, clientY: touch.clientY };
                 this.#showTreeContextMenu(fakeEvent, target);
             }, 600);
         }, { passive: true });
-        this.#treeContainer.addEventListener('touchend', e => {
+        container.addEventListener('touchend', e => {
             clearTimeout(longPressTimer);
-            if (this.tree.longPressTriggered) {
+            if (treeView.longPressTriggered) {
                 e.preventDefault();
                 return;
             }
@@ -2740,7 +2855,7 @@ class UIManager {
                 }
             }
         });
-        this.#treeContainer.addEventListener('touchmove', () => { clearTimeout(longPressTimer); touchMoved = true; }, { passive: true });
+        container.addEventListener('touchmove', () => { clearTimeout(longPressTimer); touchMoved = true; }, { passive: true });
     }
     bindTabEvents() {
         // Allow dropping a tab past the last tab (append to end)
@@ -3100,7 +3215,7 @@ class EditorApp {
         this.driveFs = new FileManager(this.state, new DriveAdapter());
         this.localFs = new FileManager(this.state, new LocalAdapter(this.pathUtils));
         this.fs = this.driveFs;
-        this.tree = new TreeManager(this.state, this.fs);
+        this.tree = new DirectoryTreeView('tree-container', this.state, this.fs, 'left');
         this.extensions = new ExtensionManager(this.state, this.fs);
         this.tabs = new TabManager(this.state, this.fs, this.extensions);
         this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions);
