@@ -955,10 +955,7 @@ class LocalAdapter extends StorageAdapter {
             throw e;
         }
     }
-    async isSameEntry(h1, h2) {
-        if (!h1 || !h2) return false;
-        return h1.isSameEntry(h2);
-    }
+    async isSameEntry(h1, h2) { return !!h1 && !!h2 && h1.isSameEntry(h2); }
     // ── Messages ──────────────────────────────────────────
     formatError(action, e) {
         if (e.name === 'NotAllowedError') return `${action} failed: permission denied – re-open folder`;
@@ -1358,11 +1355,8 @@ class DriveAdapter extends StorageAdapter {
         if (!resp.ok && resp.status !== 204) throw new Error(`Delete failed: ${resp.status}`);
     }
 
-    /** Drive API equivalent of original FSA method – deletes folder via Drive files.delete */
-    async deleteFolderEntry(target, rootHandle) {
-        const resp = await this.#api.driveRequest(`${DriveAdapter.DRIVE_API}/files/${target.handle.id}`, { method: 'DELETE' });
-        if (!resp.ok && resp.status !== 204) throw new Error(`Delete failed: ${resp.status}`);
-    }
+    /** Drive API equivalent of original FSA method – deletes folder via Drive files.delete (same REST call as deleteFileEntry) */
+    async deleteFolderEntry(target, rootHandle) { return this.deleteFileEntry(target, rootHandle); }
 
     /** Drive API equivalent of original FSA method – renames file/folder via Drive files.update */
     async renameEntry(target, newName, rootHandle) {
@@ -1414,10 +1408,7 @@ class DriveAdapter extends StorageAdapter {
     }
 
     /** Drive API equivalent of original FSA method – compares Drive file IDs */
-    async isSameEntry(h1, h2) {
-        if (!h1 || !h2) return false;
-        return h1.id === h2.id;
-    }
+    async isSameEntry(h1, h2) { return !!h1 && !!h2 && h1.id === h2.id; }
 
     // ── Messages ──────────────────────────────────────────
     formatError(action, e) {
@@ -1700,51 +1691,7 @@ class FileManager {
         );
     }
     // ── New file / folder ─────────────────────────────────
-    async #newItem(kind) {
-        if (!this.state.currentDirHandle) return this.#ui.showToast(this.adapter.notConnectedMsg);
-        const isFile = kind === 'file';
-        const activePath = this.state.activeDirectoryPath || '';
-        const rootName = this.state.currentDirHandle.name;
-        const displayPath = '/' + rootName + (activePath ? '/' + activePath : '') + '/';
-        const name = await this.#ui.showDialog({ promptTitle: isFile ? 'New file name:' : 'New folder name:', subtitle: displayPath });
-        if (!name?.trim()) return;
-        const trimmed = name.trim();
-        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
-            return this.#ui.showToast(isFile ? 'Invalid filename' : 'Invalid folder name');
-        const { dirCtx, targetPath } = await this.#getTargetDir();
-        try {
-            if (isFile) {
-                const handle = await this.adapter.createFile(trimmed, dirCtx);
-                if (targetPath) {
-                    this.state.expandedFolders.add(targetPath);
-                    this.saveExpandedState();
-                }
-                await this.mutateAndRebuild();
-                await this.tabs.createNewTab(handle, trimmed, '', targetPath ? `${targetPath}/${trimmed}` : trimmed);
-            } else {
-                await this.adapter.createFolder(trimmed, dirCtx);
-                if (targetPath) {
-                    this.state.expandedFolders.add(targetPath);
-                    this.saveExpandedState();
-                }
-                await this.mutateAndRebuild();
-                this.#ui.showToast('Folder created');
-            }
-        } catch (e) {
-            this.#ui.showToast(this.adapter.formatError(isFile ? 'Create file' : 'Create folder', e));
-        }
-        this.#ui.closeContextMenu();
-    }
-    async newFile() { return this.#newItem('file'); }
-    async newFolder() { return this.#newItem('folder'); }
-    async createFromDialog() {
-        if (!this.state.currentDirHandle) return this.#ui.showToast(this.adapter.notConnectedMsg);
-        const result = await this.#ui.showCreateDialog();
-        if (!result) return;
-        const { kind, name: trimmed } = result;
-        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
-            return this.#ui.showToast(kind === 'file' ? 'Invalid filename' : 'Invalid folder name');
-        const { dirCtx, targetPath } = await this.#getTargetDir();
+    async #createItem(kind, trimmed, dirCtx, targetPath) {
         try {
             if (kind === 'file') {
                 const handle = await this.adapter.createFile(trimmed, dirCtx);
@@ -1760,6 +1707,33 @@ class FileManager {
         } catch (e) {
             this.#ui.showToast(this.adapter.formatError(kind === 'file' ? 'Create file' : 'Create folder', e));
         }
+    }
+    async #newItem(kind) {
+        if (!this.state.currentDirHandle) return this.#ui.showToast(this.adapter.notConnectedMsg);
+        const isFile = kind === 'file';
+        const activePath = this.state.activeDirectoryPath || '';
+        const rootName = this.state.currentDirHandle.name;
+        const displayPath = '/' + rootName + (activePath ? '/' + activePath : '') + '/';
+        const name = await this.#ui.showDialog({ promptTitle: isFile ? 'New file name:' : 'New folder name:', subtitle: displayPath });
+        if (!name?.trim()) return;
+        const trimmed = name.trim();
+        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
+            return this.#ui.showToast(isFile ? 'Invalid filename' : 'Invalid folder name');
+        const { dirCtx, targetPath } = await this.#getTargetDir();
+        await this.#createItem(kind, trimmed, dirCtx, targetPath);
+        this.#ui.closeContextMenu();
+    }
+    async newFile() { return this.#newItem('file'); }
+    async newFolder() { return this.#newItem('folder'); }
+    async createFromDialog() {
+        if (!this.state.currentDirHandle) return this.#ui.showToast(this.adapter.notConnectedMsg);
+        const result = await this.#ui.showCreateDialog();
+        if (!result) return;
+        const { kind, name: trimmed } = result;
+        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
+            return this.#ui.showToast(kind === 'file' ? 'Invalid filename' : 'Invalid folder name');
+        const { dirCtx, targetPath } = await this.#getTargetDir();
+        await this.#createItem(kind, trimmed, dirCtx, targetPath);
     }
     async createUntitledFile() {
         if (!this.state.currentDirHandle) return null;
@@ -2299,15 +2273,13 @@ class TabManager {
                 tab.type = 'text';
                 extToggle.className = 'ext-toggle inactive';
                 if (tab.extFrame) tab.extFrame.classList.add('hidden');
-                tab._pendingTypeSwitch = true;
-                this.switchToTab(tab.id);
             } else {
                 if (this.state.currentTabId === tab.id) tab.content = this.textarea.value;
                 tab.type = 'extension';
                 extToggle.className = 'ext-toggle active';
-                tab._pendingTypeSwitch = true;
-                this.switchToTab(tab.id);
             }
+            tab._pendingTypeSwitch = true;
+            this.switchToTab(tab.id);
         };
     }
     #createExtToggle(tab, ext) {
@@ -2451,12 +2423,9 @@ class TabManager {
         const closeBtn = document.createElement('span');
         closeBtn.className = 'close';
         closeBtn.textContent = '×';
-        if (tab.type === 'extension') {
-            const extToggle = this.#createExtToggle(tab, tab.extension);
-            tabEl.append(extToggle, tabName, dirtyInd, closeBtn);
-        } else if (tab.type === 'text') {
-            const extToggle = this.#createExtToggle(tab, null);
-            tabEl.append(extToggle, tabName, dirtyInd, closeBtn);
+        // text tabs always have tab.extension===null (ensured by #createTab); extension tabs carry their ext object
+        if (tab.type === 'text' || tab.type === 'extension') {
+            tabEl.append(this.#createExtToggle(tab, tab.extension), tabName, dirtyInd, closeBtn);
         } else {
             tabEl.append(tabName, dirtyInd, closeBtn);
         }
@@ -2783,17 +2752,27 @@ class UIManager {
         });
     }
     toggleSidebar() {
-        const isCurrentlyHidden = this.#sidebarEl.classList.contains('hidden');
-        if (isCurrentlyHidden) {
+        const hidden = this.#sidebarEl.classList.toggle('hidden');
+        if (!hidden) {
             const savedWidth = localStorage.getItem('sidebarWidth');
             if (savedWidth) this.#sidebarEl.style.width = savedWidth;
-            this.#sidebarEl.classList.remove('hidden');
         } else {
             this.#sidebarEl.style.width = '';
-            this.#sidebarEl.classList.add('hidden');
         }
-        const btn = document.getElementById('sidebar-toggle');
-        btn.textContent = this.#sidebarEl.classList.contains('hidden') ? '›' : '‹';
+        document.getElementById('sidebar-toggle').textContent = hidden ? '›' : '‹';
+    }
+    #showTreeContextMenu(e, target) {
+        const row = target.closest('.tree-row');
+        if (row && row.dataset.path) {
+            const node = this.tree.getNode(row.dataset.path);
+            if (node) {
+                this.state.activeDirectoryPath = this.#parentDirPath(node);
+                this.showContextMenu(e, node);
+            }
+        } else {
+            this.state.activeDirectoryPath = null;
+            this.showContextMenu(e, null);
+        }
     }
     showContextMenu(e, node) {
         e.preventDefault();
@@ -2978,17 +2957,7 @@ class UIManager {
             if (!e.target.closest('.context-menu')) this.closeContextMenu();
         });
         this.#treeContainer.addEventListener('contextmenu', e => {
-            const row = e.target.closest('.tree-row');
-            if (row && row.dataset.path) {
-                const node = this.tree.getNode(row.dataset.path);
-                if (node) {
-                    this.state.activeDirectoryPath = this.#parentDirPath(node);
-                    this.showContextMenu(e, node);
-                }
-            } else {
-                this.state.activeDirectoryPath = null;
-                this.showContextMenu(e, null);
-            }
+            this.#showTreeContextMenu(e, e.target);
         });
         let longPressTimer = null;
         let touchMoved = false;
@@ -3000,17 +2969,7 @@ class UIManager {
             longPressTimer = setTimeout(() => {
                 this.tree.longPressTriggered = true;
                 const fakeEvent = { preventDefault() {}, clientX: touch.clientX, clientY: touch.clientY };
-                const row = target.closest('.tree-row');
-                if (row && row.dataset.path) {
-                    const node = this.tree.getNode(row.dataset.path);
-                    if (node) {
-                        this.state.activeDirectoryPath = this.#parentDirPath(node);
-                        this.showContextMenu(fakeEvent, node);
-                    }
-                } else {
-                    this.state.activeDirectoryPath = null;
-                    this.showContextMenu(fakeEvent, null);
-                }
+                this.#showTreeContextMenu(fakeEvent, target);
             }, 600);
         }, { passive: true });
         this.#treeContainer.addEventListener('touchend', e => {
@@ -3134,23 +3093,18 @@ class UIManager {
     #bindSettingsPopover() {
         const settingsBtn = document.getElementById('tab-settings-btn');
         const popover = document.getElementById('tab-settings-popover');
+        const positionPopover = () => {
+            if (popover.classList.contains('hidden')) return;
+            const rect = settingsBtn.getBoundingClientRect();
+            popover.style.top = rect.bottom + 'px';
+            popover.style.left = rect.left + 'px';
+        };
         settingsBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             popover.classList.toggle('hidden');
-            if (!popover.classList.contains('hidden')) {
-                const rect = settingsBtn.getBoundingClientRect();
-                popover.style.top = rect.bottom + 'px';
-                popover.style.left = rect.left + 'px';
-            }
+            positionPopover();
         });
-        // Reposition popover on window resize
-        window.addEventListener('resize', () => {
-            if (!popover.classList.contains('hidden')) {
-                const rect = settingsBtn.getBoundingClientRect();
-                popover.style.top = rect.bottom + 'px';
-                popover.style.left = rect.left + 'px';
-            }
-        });
+        window.addEventListener('resize', positionPopover);
         // Close popover when clicking outside
         document.addEventListener('click', (e) => {
             if (!popover.contains(e.target) && !settingsBtn.contains(e.target)) {
@@ -3184,27 +3138,17 @@ class UIManager {
         const applyFontSize = sz => {
             this.#textarea.style.fontSize = sz + 'px';
             this.#gutter.style.fontSize = sz + 'px';
+            localStorage.setItem('editorFontSize', sz);
         };
         document.getElementById('settings-font-decrease').addEventListener('click', () => {
             const cur = parseInt(this.#textarea.style.fontSize) || DEFAULT_FONT_SIZE;
-            if (cur > MIN_FONT) {
-                const next = cur - 1;
-                applyFontSize(next);
-                localStorage.setItem('editorFontSize', next);
-            }
+            if (cur > MIN_FONT) applyFontSize(cur - 1);
         });
         document.getElementById('settings-font-increase').addEventListener('click', () => {
             const cur = parseInt(this.#textarea.style.fontSize) || DEFAULT_FONT_SIZE;
-            if (cur < MAX_FONT) {
-                const next = cur + 1;
-                applyFontSize(next);
-                localStorage.setItem('editorFontSize', next);
-            }
+            if (cur < MAX_FONT) applyFontSize(cur + 1);
         });
-        document.getElementById('settings-font-reset').addEventListener('click', () => {
-            applyFontSize(DEFAULT_FONT_SIZE);
-            localStorage.setItem('editorFontSize', DEFAULT_FONT_SIZE);
-        });
+        document.getElementById('settings-font-reset').addEventListener('click', () => applyFontSize(DEFAULT_FONT_SIZE));
     }
     // Returns true if permission is already granted, false if user action is needed
     async #revalidatePermission() {
