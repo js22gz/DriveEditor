@@ -2540,26 +2540,37 @@ class TabManager {
         }
         this.switchToTab(this.state.tabs[Math.min(idx, this.state.tabs.length - 1)].id);
     }
-    async restoreOpenTabs(dirHandle, savedTabs) {
-        if (!savedTabs) savedTabs = this.fs.loadOpenTabs();
-        let restored = 0;
-        let activeTabPath = null;
-        for (const st of savedTabs) {
-            try {
+async restoreOpenTabs(savedHandle, savedTabs = this.fs.loadOpenTabs()) {
+    let restored = 0;
+    let activeTabPath = null;
+
+    for (const st of savedTabs) {
+        try {
+            // Try to restore using path (legacy FSA) or storageId (new Drive)
+            let fileHandle;
+            if (st.storageId) {
+                // Drive case: reconstruct fake handle from id
+                fileHandle = await this.fs.adapter.#makeHandle(st.storageId, st.name, 'file');
+            } else if (st.path) {
+                // Legacy FSA path traversal
                 const parts = st.path.split('/').filter(Boolean);
-                let handle = dirHandle;
+                let current = savedHandle;
                 for (let i = 0; i < parts.length - 1; i++) {
-                    handle = await handle.getDirectoryHandle(parts[i]);
+                    current = await current.getDirectoryHandle(parts[i]);
                 }
-                const fileHandle = await handle.getFileHandle(parts[parts.length - 1]);
-                const file = await fileHandle.getFile();
-                const content = await file.text();
-                await this.createNewTab(fileHandle, st.name, content, st.path, st.type || 'text');
-                if (st.active) activeTabPath = st.path;
-                restored++;
-            } catch { }
+                fileHandle = await current.getFileHandle(parts[parts.length - 1]);
+            } else continue;
+
+            const file = await fileHandle.getFile();
+            const content = await file.text();
+            await this.createNewTab(fileHandle, st.name, content, st.path, st.type || 'text');
+            if (st.active) activeTabPath = st.path;
+            restored++;
+        } catch (e) {
+            console.warn(`Failed to restore tab ${st.name || st.path}`, e);
         }
-        if (activeTabPath) {
+    }
+	if (activeTabPath) {
             const activeTab = this.state.tabs.find(t => t.path === activeTabPath);
             if (activeTab) this.switchToTab(activeTab.id);
         } else if (this.state.tabs.length > 0) {
