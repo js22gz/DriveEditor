@@ -455,6 +455,7 @@ header:fullscreen { display: none; }
   .tree-row { min-height: 44px; padding: 10px 8px 10px 12px; }
   .tree-vline, .tree-tee, .tree-elbow { top: -10px; }
   .tree-vline, .tree-tee { bottom: -10px; }
+  #gutter { width: 36px; padding: 12px 4px 0 0; font-size: 12px; }
 }
 #local-folder-btn {
   position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
@@ -962,6 +963,27 @@ async openFileFromNode(node) {
     }
     async newFile() { return this.#newItem('file'); }
     async newFolder() { return this.#newItem('folder'); }
+    async createFromDialog() {
+        if (!this.state.currentDirHandle) return this.ui.showToast('Open a folder first');
+        const result = await this.ui.showCreateDialog();
+        if (!result) return;
+        const { kind, name: trimmed } = result;
+        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
+            return this.ui.showToast(kind === 'file' ? 'Invalid filename' : 'Invalid folder name');
+        const { dir, targetPath } = await this.#getTargetDir();
+        if (kind === 'file') {
+            const handle = await dir.getFileHandle(trimmed, { create: true });
+            await this.#write(handle, '');
+            if (targetPath) { this.state.expandedFolders.add(targetPath); this.saveExpandedState(); }
+            await this.mutateAndRebuild();
+            await this.tabs.createNewTab(handle, trimmed, '', targetPath ? `${targetPath}/${trimmed}` : trimmed);
+        } else {
+            await dir.getDirectoryHandle(trimmed, { create: true });
+            if (targetPath) { this.state.expandedFolders.add(targetPath); this.saveExpandedState(); }
+            await this.mutateAndRebuild();
+            this.ui.showToast('Folder created');
+        }
+    }
     async createUntitledFile() {
         if (!this.state.currentDirHandle) return null;
         const root = this.state.currentDirHandle;
@@ -1806,6 +1828,30 @@ class GoogleDriveManager {
     async newFile() { return this.#newItem('file'); }
     /** Drive API equivalent of original FSA method */
     async newFolder() { return this.#newItem('folder'); }
+    async createFromDialog() {
+        if (!this.state.currentDirHandle) return this.ui.showToast('Connect Google Account first');
+        const result = await this.ui.showCreateDialog();
+        if (!result) return;
+        const { kind, name: trimmed } = result;
+        if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
+            return this.ui.showToast(kind === 'file' ? 'Invalid filename' : 'Invalid folder name');
+        const { dirId, targetPath } = await this.#getTargetDir();
+        try {
+            if (kind === 'file') {
+                const handle = await this.#createDriveFile(trimmed, dirId, '');
+                if (targetPath) { this.state.expandedFolders.add(targetPath); this.saveExpandedState(); }
+                await this.mutateAndRebuild();
+                await this.tabs.createNewTab(handle, trimmed, '', targetPath ? `${targetPath}/${trimmed}` : trimmed);
+            } else {
+                await this.#createDriveFolder(trimmed, dirId);
+                if (targetPath) { this.state.expandedFolders.add(targetPath); this.saveExpandedState(); }
+                await this.mutateAndRebuild();
+                this.ui.showToast('Folder created');
+            }
+        } catch (e) {
+            this.ui.showToast(this.#formatError(kind === 'file' ? 'Create file' : 'Create folder', e));
+        }
+    }
 
     /** Drive API equivalent of original FSA method – creates untitled file in Drive root */
     async createUntitledFile() {
@@ -2243,6 +2289,7 @@ class TreeManager {
         const safeName = this.state.currentDirHandle.name;
         this.rootDirNameEl.textContent = safeName;
         this.sidebarHeaderActionsEl.innerHTML =
+            '<span class="directory-clear" id="add-new-item" title="Create new file or folder">+</span>' +
             '<span class="directory-clear" id="refresh-folder" title="Refresh tree">⟳</span>' +
             '<span class="directory-clear" id="clear-folder">⌫</span>';
     }
@@ -2851,6 +2898,58 @@ class UIManager {
             modal.onclick = e => { if (e.target === modal) cancel(); };
         });
     }
+    showCreateDialog() {
+        return new Promise(resolve => {
+            const modal = document.createElement('div');
+            modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;z-index:10001;';
+            let selectedKind = null;
+            modal.innerHTML =
+                `<div style="background:#18181b;padding:24px;border-radius:8px;min-width:320px;border:1px solid #27272a;">` +
+                /* Layer 1 – title */
+                `<div style="text-align:center;margin-bottom:16px;"><h3 style="margin:0;font-size:16px;color:#e4e4e7;font-weight:600;">Create</h3></div>` +
+                /* Layer 2 – file / directory radio boxes */
+                `<div style="display:flex;gap:8px;margin-bottom:16px;" id="create-kind-row">` +
+                `<button data-kind="file" style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:4px;cursor:pointer;font-size:14px;">File</button>` +
+                `<button data-kind="directory" style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:4px;cursor:pointer;font-size:14px;">Directory</button>` +
+                `</div>` +
+                /* Layer 3 – filename input */
+                `<div style="margin-bottom:16px;">` +
+                `<input type="text" placeholder="Enter name…" style="width:100%;padding:10px;background:#27272a;border:1px solid #3f3f46;color:#e4e4e7;border-radius:4px;font-size:16px;box-sizing:border-box;">` +
+                `</div>` +
+                /* Layer 4 – OK / Cancel */
+                `<div style="display:flex;gap:8px;">` +
+                `<button style="flex:1;min-height:44px;background:#a1a1aa;color:#09090b;border:none;border-radius:4px;cursor:pointer;font-size:14px;">OK</button>` +
+                `<button style="flex:1;min-height:44px;background:#27272a;color:#e4e4e7;border:none;border-radius:4px;cursor:pointer;font-size:14px;">Cancel</button>` +
+                `</div></div>`;
+            const [fileBtn, dirBtn] = modal.querySelectorAll('#create-kind-row button');
+            const input = modal.querySelector('input');
+            const container = modal.firstElementChild;
+            const [okBtn, cancelBtn] = container.lastElementChild.querySelectorAll('button');
+            const selectKind = kind => {
+                selectedKind = kind;
+                fileBtn.style.background = kind === 'file' ? '#a1a1aa' : '#27272a';
+                fileBtn.style.color = kind === 'file' ? '#09090b' : '#e4e4e7';
+                fileBtn.style.borderColor = kind === 'file' ? '#a1a1aa' : '#3f3f46';
+                dirBtn.style.background = kind === 'directory' ? '#a1a1aa' : '#27272a';
+                dirBtn.style.color = kind === 'directory' ? '#09090b' : '#e4e4e7';
+                dirBtn.style.borderColor = kind === 'directory' ? '#a1a1aa' : '#3f3f46';
+            };
+            fileBtn.onclick = () => selectKind('file');
+            dirBtn.onclick = () => selectKind('directory');
+            document.body.appendChild(modal);
+            input.focus();
+            const confirm = () => {
+                if (!selectedKind || !input.value.trim()) return;
+                resolve({ kind: selectedKind, name: input.value.trim() });
+                modal.remove();
+            };
+            const cancel = () => { resolve(null); modal.remove(); };
+            input.onkeydown = e => { if (e.key === 'Enter') confirm(); if (e.key === 'Escape') cancel(); };
+            okBtn.onclick = confirm;
+            cancelBtn.onclick = cancel;
+            modal.onclick = e => { if (e.target === modal) cancel(); };
+        });
+    }
     toggleSidebar() {
         const isCurrentlyHidden = this.#sidebarEl.classList.contains('hidden');
         if (isCurrentlyHidden) {
@@ -2964,7 +3063,7 @@ class UIManager {
             const words = trimmed ? trimmed.split(/\s+/).length : 0;
             this.#statusEl.textContent = `Ln ${line}, Col ${col} | ${words} word${words !== 1 ? 's' : ''} | ${this.state.tabs.length} tab${this.state.tabs.length !== 1 ? 's' : ''}`;
         }
-        this.#editorStatusEl.textContent = tab.name + modified;
+        this.#editorStatusEl.textContent = tab.dirty ? 'Modified' : '';
     }
     bindKeyboard() {
         document.addEventListener('keydown', e => {
@@ -3037,6 +3136,7 @@ class UIManager {
             if (srcPath) this.fs.moveEntry(srcPath, '');
         });
         document.addEventListener('click', e => {
+            if (e.target.id === 'add-new-item') { e.stopPropagation(); this.fs.createFromDialog(); return; }
             if (e.target.id === 'clear-folder') { e.stopPropagation(); this.fs.clearSavedFolder(); return; }
             if (e.target.id === 'refresh-folder') {
                 e.stopPropagation();
@@ -3165,11 +3265,20 @@ class UIManager {
         });
         const slider = document.getElementById('width-slider');
         const valueEl = document.getElementById('width-value');
+        const MIN_CHARS = 24;
         const MAX_CHARS = 200;
+        const mobileQuery = window.matchMedia('(max-width: 768px)');
+        const mapSlider = raw => {
+            if (raw >= MAX_CHARS) return MAX_CHARS;
+            if (!mobileQuery.matches) return raw;
+            /* Exponential curve for mobile: spreads lower char values across most of the slider range */
+            const t = (raw - MIN_CHARS) / (MAX_CHARS - MIN_CHARS); /* 0 → 1 */
+            return Math.round(MIN_CHARS + (MAX_CHARS - MIN_CHARS) * (t * t));
+        };
         slider.addEventListener('input', e => {
-            const v = +e.target.value;
-            valueEl.textContent = (v === MAX_CHARS) ? '∞' : `${v} ch`;
-            if (v === MAX_CHARS) {
+            const v = mapSlider(+e.target.value);
+            valueEl.textContent = (v >= MAX_CHARS) ? '∞' : `${v} ch`;
+            if (v >= MAX_CHARS) {
                 this.#textarea.style.maxWidth = 'none';
                 this.#textarea.style.minWidth = 'auto';
                 this.#textarea.style.whiteSpace = 'pre';
