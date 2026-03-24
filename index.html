@@ -980,6 +980,7 @@ class DriveAdapter extends StorageAdapter {
     #accessToken = null;
     #tokenClient = null;
     #tokenExpiresAt = 0;
+    #initingTokenClient = null;
 
     static CLIENT_ID = '34955986708-opg5tgv2kmlt7ceu85orvrjokgaq2m6l.apps.googleusercontent.com';
     static SCOPES = 'https://www.googleapis.com/auth/drive';
@@ -1085,14 +1086,18 @@ class DriveAdapter extends StorageAdapter {
         });
     }
     async #initTokenClient() {
-        await window.__loadGIS();
-        if (typeof google === 'undefined' || !google.accounts?.oauth2)
-            throw new Error('Google Identity Services not loaded');
-        if (DriveAdapter.CLIENT_ID.includes('YOUR_CLIENT_ID'))
-            throw new Error('Replace DriveAdapter.CLIENT_ID with your OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials');
-        this.#tokenClient = google.accounts.oauth2.initTokenClient({
-            client_id: DriveAdapter.CLIENT_ID, scope: DriveAdapter.SCOPES, callback: () => {},
-        });
+        if (this.#initingTokenClient) return this.#initingTokenClient;
+        this.#initingTokenClient = (async () => {
+            await window.__loadGIS();
+            if (typeof google === 'undefined' || !google.accounts?.oauth2)
+                throw new Error('Google Identity Services failed to initialize after loading');
+            if (DriveAdapter.CLIENT_ID.includes('YOUR_CLIENT_ID'))
+                throw new Error('Replace DriveAdapter.CLIENT_ID with your OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials');
+            this.#tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: DriveAdapter.CLIENT_ID, scope: DriveAdapter.SCOPES, callback: () => {},
+            });
+        })();
+        try { await this.#initingTokenClient; } finally { this.#initingTokenClient = null; }
     }
     makeFileHandle(id, name) { return this.#api.makeHandle(id, name, 'file'); }
     async saveFolderHandle(handle) {
