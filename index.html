@@ -126,7 +126,21 @@ window.LEGEND = `<!--
     <title>EDITOR</title>
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#18181b">
-    <script src="https://accounts.google.com/gsi/client" async></script>
+    <script>
+    // Lazy-load Google Identity Services only when Drive backend is needed
+    window.__loadGIS = () => {
+        if (window.__gisLoaded) return window.__gisLoaded;
+        window.__gisLoaded = new Promise((resolve, reject) => {
+            if (typeof google !== 'undefined' && google.accounts?.oauth2) { resolve(); return; }
+            const s = document.createElement('script');
+            s.src = 'https://accounts.google.com/gsi/client';
+            s.onload = () => resolve();
+            s.onerror = () => reject(new Error('Failed to load Google Identity Services'));
+            document.head.appendChild(s);
+        });
+        return window.__gisLoaded;
+    };
+    </script>
 <style>
 /* ────────────────────────────────────────────────────────
    1. VARIABLES & THEME
@@ -523,7 +537,7 @@ header:fullscreen { display: none; }
         <aside id="sidebar">
             <div id="sidebar-header">
                 <div id="sidebar-root-row" class="sidebar-header-row" title="Click to open folder">
-                    <span><span id="root-dir-name">Connect Google Account</span></span>
+                    <span><span id="root-dir-name">Open a Folder</span></span>
                     <span id="sidebar-header-actions"></span>
                 </div>
             </div>
@@ -534,7 +548,7 @@ header:fullscreen { display: none; }
         <aside id="sidebar-right" class="hidden">
             <div id="sidebar-header-right">
                 <div id="sidebar-root-row-right" class="sidebar-header-row" title="Click to open folder">
-                    <span><span id="root-dir-name-right">Connect Google Account</span></span>
+                    <span><span id="root-dir-name-right">Open a Folder</span></span>
                     <span id="sidebar-header-actions-right"></span>
                 </div>
             </div>
@@ -707,6 +721,7 @@ class StorageAdapter {
         this.pathUtils = pathUtils;
         /** @type {UIManager} */ this.ui = null;
     }
+    get isDrive() { return this.#isDrive; }
     get db() { return IndexedDBHelper.db; }
     async initDB() { await IndexedDBHelper.open(); }
     // ── Private FSA helpers ───────────────────────────────
@@ -965,6 +980,7 @@ class DriveAdapter extends StorageAdapter {
     #accessToken = null;
     #tokenClient = null;
     #tokenExpiresAt = 0;
+    #initingTokenClient = null;
 
     static CLIENT_ID = '34955986708-opg5tgv2kmlt7ceu85orvrjokgaq2m6l.apps.googleusercontent.com';
     static SCOPES = 'https://www.googleapis.com/auth/drive';
@@ -1057,8 +1073,8 @@ class DriveAdapter extends StorageAdapter {
 
     async #ensureToken() {
         if (this.#accessToken && Date.now() < this.#tokenExpiresAt - 60000) return this.#accessToken;
+        if (!this.#tokenClient) await this.#initTokenClient();
         return new Promise((resolve, reject) => {
-            if (!this.#tokenClient) this.#initTokenClient();
             this.#tokenClient.callback = (resp) => {
                 if (resp.error) { reject(new Error(resp.error)); return; }
                 this.#accessToken = resp.access_token;
@@ -1069,14 +1085,19 @@ class DriveAdapter extends StorageAdapter {
             this.#tokenClient.requestAccessToken({ prompt: this.#accessToken ? '' : 'consent' });
         });
     }
-    #initTokenClient() {
-        if (typeof google === 'undefined' || !google.accounts?.oauth2)
-            throw new Error('Google Identity Services not loaded');
-        if (DriveAdapter.CLIENT_ID.includes('YOUR_CLIENT_ID'))
-            throw new Error('Replace DriveAdapter.CLIENT_ID with your OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials');
-        this.#tokenClient = google.accounts.oauth2.initTokenClient({
-            client_id: DriveAdapter.CLIENT_ID, scope: DriveAdapter.SCOPES, callback: () => {},
-        });
+    async #initTokenClient() {
+        if (this.#initingTokenClient) return this.#initingTokenClient;
+        this.#initingTokenClient = (async () => {
+            await window.__loadGIS();
+            if (typeof google === 'undefined' || !google.accounts?.oauth2)
+                throw new Error('Google Identity Services failed to initialize after loading');
+            if (DriveAdapter.CLIENT_ID.includes('YOUR_CLIENT_ID'))
+                throw new Error('Replace DriveAdapter.CLIENT_ID with your OAuth 2.0 Client ID from https://console.cloud.google.com/apis/credentials');
+            this.#tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: DriveAdapter.CLIENT_ID, scope: DriveAdapter.SCOPES, callback: () => {},
+            });
+        })();
+        try { await this.#initingTokenClient; } finally { this.#initingTokenClient = null; }
     }
     makeFileHandle(id, name) { return this.#api.makeHandle(id, name, 'file'); }
     async saveFolderHandle(handle) {
@@ -1881,7 +1902,8 @@ class DirectoryTreeView {
     }
     updateHeader() {
         if (!this.#fileTree || !this.state.currentDirHandle) {
-            this.rootDirNameEl.textContent = 'Click to open folder';
+            const isDrive = this.fs?.adapter?.isDrive;
+            this.rootDirNameEl.textContent = isDrive ? 'Connect Google Account' : 'Open a local folder';
             this.sidebarHeaderActionsEl.replaceChildren();
             for (const lv of this.#linkedViews) lv.updateHeader();
             return;
@@ -3233,15 +3255,18 @@ class EditorApp {
     constructor() {
         this.state = new ReactiveState();
         this.pathUtils = new PathUtils();
-        // Default to Google Drive backend; keep local FS as fallback
         this.driveFs = new FileManager(this.state, new DriveAdapter());
         this.localFs = new FileManager(this.state, new LocalAdapter(this.pathUtils));
-        this.fs = this.driveFs;
+        // Restore last-used backend; default to Google Drive for new users
+        const saved = localStorage.getItem('activeBackend');
+        this.fs = (saved === 'local' && 'showDirectoryPicker' in window)
+            ? this.localFs : this.driveFs;
         this.tree = new DirectoryTreeView('tree-container', this.state, this.fs, 'left');
         this.extensions = new ExtensionManager(this.state, this.fs);
         this.tabs = new TabManager(this.state, this.fs, this.extensions);
         this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions);
         this.#wireBackend(this.fs);
+        this.#updateBackendBtn();
     }
     #wireBackend(fs) {
         fs.tree = this.tree;
@@ -3258,6 +3283,7 @@ class EditorApp {
         this.extensions.fs = fs;
         this.#wireBackend(fs);
         this.#updateBackendBtn();
+        localStorage.setItem('activeBackend', fs === this.localFs ? 'local' : 'drive');
     }
     #updateBackendBtn() {
         const btn = document.getElementById('local-folder-btn');
