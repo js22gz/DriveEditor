@@ -846,12 +846,13 @@ class StorageAdapter {
     async connectRoot() { throw new Error('StorageAdapter: connectRoot is abstract'); }
     // ── File I/O ──────────────────────────────────────────
     async readNode(node) { const file = await node.handle.getFile(); return file.text(); }
+    async getNodeSize(node) { return (await node.handle.getFile()).size; }
     async pickFile() {
         try {
             const [handle] = await window.showOpenFilePicker();
             const file = await handle.getFile();
             const content = await file.text();
-            return { handle, name: file.name, content };
+            return { handle, name: file.name, content, size: file.size };
         } catch (e) { if (e.name === 'AbortError') return null; throw e; }
     }
     async openNodeInBrowser(node) {
@@ -1199,6 +1200,12 @@ class DriveAdapter extends StorageAdapter {
         if (!resp.ok) throw new Error(`Read failed: ${resp.status}`);
         return resp.text();
     }
+    async getNodeSize(node) {
+        const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?fields=size`);
+        if (!resp.ok) throw new Error(`Size check failed: ${resp.status}`);
+        const data = await resp.json();
+        return parseInt(data.size, 10) || 0;
+    }
     async pickFile() { this.ui.showToast('Use the file tree to open files from Google Drive'); return null; }
     async openNodeInBrowser(node) {
         const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?fields=webViewLink`);
@@ -1299,6 +1306,7 @@ class DriveAdapter extends StorageAdapter {
 // ────────────────────────────────────────────────────────
 class FileManager {
     #INVALID_CHARS = /[<>:"|?*\x00-\x1F]/;
+    #MAX_FILE_SIZE = 3 * 1024 * 1024;
     #saveInProgress = false;
     #restoring = false;
     #restoreStartedAt = 0;
@@ -1492,6 +1500,15 @@ class FileManager {
         });
     }
     // ── Open folder / file ────────────────────────────────
+    async #confirmLargeFile(size) {
+        if (size <= this.#MAX_FILE_SIZE) return true;
+        const sizeMB = (size / (1024 * 1024)).toFixed(1);
+        return this.#ui.showDialog({
+            isConfirm: true,
+            confirmMessage: `This file is ${sizeMB} MB. Files over 3 MB may slow down or break the app. Open anyway?`,
+            danger: true
+        });
+    }
     async openFolder() {
         try {
             const rootHandle = await this.adapter.connectRoot();
@@ -1513,7 +1530,8 @@ class FileManager {
         try {
             const result = await this.adapter.pickFile();
             if (!result) return;
-            const { handle, name, content } = result;
+            const { handle, name, content, size } = result;
+            if (!await this.#confirmLargeFile(size)) return;
             for (const t of this.state.tabs) {
                 if (t.handle && await this.isSameEntry(t.handle, handle)) {
                     this.tabs.switchToTab(t.id);
@@ -1527,6 +1545,8 @@ class FileManager {
     }
     async openFileFromNode(node) {
         try {
+            const size = await this.adapter.getNodeSize(node);
+            if (!await this.#confirmLargeFile(size)) return;
             const content = await this.adapter.readNode(node);
             await this.tabs.createNewTab(node.handle, node.name, content, node.path);
             if (this.#ui.isMobile && !this.#ui.sidebarEl.classList.contains('hidden')) {
