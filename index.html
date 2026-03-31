@@ -673,9 +673,22 @@ class IndexedDBHelper {
                 if (!db.objectStoreNames.contains('handles')) db.createObjectStore('handles');
                 if (!db.objectStoreNames.contains('extensions')) db.createObjectStore('extensions');
             };
-            req.onsuccess = e => { IndexedDBHelper.#db = e.target.result; resolve(IndexedDBHelper.#db); };
+            req.onsuccess = e => {
+                IndexedDBHelper.#db = e.target.result;
+                // Reset cached ref when browser closes the connection (sleep / low-memory)
+                IndexedDBHelper.#db.onclose = () => { IndexedDBHelper.#db = null; };
+                resolve(IndexedDBHelper.#db);
+            };
             req.onerror = () => resolve(null);
         });
+    }
+    /** Verify the cached connection is still alive; re-open if needed */
+    static async ensureOpen() {
+        if (IndexedDBHelper.#db) {
+            try { IndexedDBHelper.#db.transaction('handles'); return IndexedDBHelper.#db; }
+            catch (e) { console.warn('IndexedDB connection stale, reopening', e); IndexedDBHelper.#db = null; }
+        }
+        return IndexedDBHelper.open();
     }
     static async get(store, key) {
         const db = await IndexedDBHelper.open();
@@ -2419,6 +2432,8 @@ class UIManager {
     #wakeRestoring = false;
     #lastHiddenAt = 0;
     #wakeRetryTimer = null;
+    #lastHeartbeat = Date.now();
+    #heartbeatId = null;
 	    /** @param {ReactiveState} state @param {TabManager} tabs @param {DirectoryTreeView} tree @param {FileManager} fs @param {ExtensionManager} extensions */
     constructor(state, tabs, tree, fs, extensions) {
         this.state = state;
@@ -3134,6 +3149,8 @@ class UIManager {
         if (this.#wakeRestoring) return;
         this.#wakeRestoring = true;
         try {
+            // Ensure IndexedDB connection is still alive after sleep
+            await IndexedDBHelper.ensureOpen();
             const permOk = await this.#revalidatePermission();
             if (permOk && this.state.currentDirHandle) {
                 // Small settle delay — some platforms need a moment after wake
@@ -3201,11 +3218,15 @@ class UIManager {
         });
 
         // Fallback wake detection — some platforms do not fire visibilitychange
-        // reliably after sleep / power-saver mode.  Only act when enough time
-        // has elapsed since the page was last hidden (avoids duplicate work on
-        // quick alt-tab / tab-switches).
+        // reliably after sleep / power-saver mode.  A heartbeat timer detects
+        // long gaps (indicating the JS event-loop was paused) so we can restore
+        // even when no visibility event arrived.
+        this.#heartbeatId = setInterval(() => { this.#lastHeartbeat = Date.now(); }, 10_000);
         window.addEventListener('focus', () => {
-            if (this.#lastHiddenAt && Date.now() - this.#lastHiddenAt > 5000) {
+            const heartbeatGap = Date.now() - this.#lastHeartbeat;
+            const hiddenElapsed = this.#lastHiddenAt ? Date.now() - this.#lastHiddenAt : 0;
+            if (heartbeatGap > 30_000 || hiddenElapsed > 5000) {
+                this.#lastHeartbeat = Date.now();
                 this.#wakeRestore();
             }
         });
