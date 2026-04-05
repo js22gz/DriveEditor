@@ -1433,7 +1433,12 @@ class FileManager {
             const data = this.state.tabs
                 .filter(t => t.path)
                 .map(t => ({ path: t.path, name: t.name, type: t.type, active: t.id === currentId, storageId: t.handle?.id }));
-            if (data.length || this.state.currentDirHandle) {
+            // Only persist when there are real file tabs.  When the list is empty
+            // (e.g. only the welcome tab is open) we deliberately do NOT overwrite
+            // localStorage — this preserves previously saved tab data so it can be
+            // restored on the next reload.  Intentional clears (close-all-tabs,
+            // switch-backend) already call localStorage.removeItem('openTabs').
+            if (data.length) {
                 localStorage.setItem('openTabs', JSON.stringify(data));
             }
         } catch {}
@@ -2454,6 +2459,7 @@ class UIManager {
     #wakeRetryTimer = null;
     #lastHeartbeat = Date.now();
     #heartbeatId = null;
+    #initComplete = false;
 	    /** @param {ReactiveState} state @param {TabManager} tabs @param {DirectoryTreeView} tree @param {FileManager} fs @param {ExtensionManager} extensions */
     constructor(state, tabs, tree, fs, extensions) {
         this.state = state;
@@ -2516,6 +2522,7 @@ class UIManager {
         await this.fs.initDB();
         await this.extensions.loadAll();
         await this.fs.restoreSession();
+        this.#initComplete = true;
     }
     showToast(message, duration = 2800) {
         const t = document.createElement('div');
@@ -3102,13 +3109,15 @@ class UIManager {
             await this.fs.restoreSession();
             return !!this.state.currentDirHandle;
         }
-        let perm = await this.fs.queryPermission(this.state.currentDirHandle);
-        if (perm === 'granted') return true;
-        // Retry once after a short delay — permissions can be transiently
-        // unavailable right after waking from sleep / power-saver mode
-        await new Promise(r => setTimeout(r, 1500));
-        perm = await this.fs.queryPermission(this.state.currentDirHandle);
-        if (perm === 'granted') return true;
+        // On ChromeOS deep sleep the filesystem / network can take several
+        // seconds to become available again.  Try up to 3 times with
+        // increasing back-off before falling back to a user-gesture prompt.
+        const delays = [0, 1500, 3000];
+        for (const delay of delays) {
+            if (delay) await new Promise(r => setTimeout(r, delay));
+            const perm = await this.fs.queryPermission(this.state.currentDirHandle);
+            if (perm === 'granted') return true;
+        }
         this.showActionToast('Tap to restore folder access', async () => {
             try {
                 const result = await this.state.currentDirHandle.requestPermission({ mode: 'readwrite' });
@@ -3166,7 +3175,7 @@ class UIManager {
     }
     // Centralized wake handler — guards against concurrent calls
     async #wakeRestore() {
-        if (this.#wakeRestoring) return;
+        if (this.#wakeRestoring || !this.#initComplete) return;
         this.#wakeRestoring = true;
         try {
             // Ensure IndexedDB connection is still alive after sleep
@@ -3187,13 +3196,27 @@ class UIManager {
             }
         } catch (e) {
             console.warn('Wake restore failed', e);
+            // Fallback: attempt a full session restore when the primary wake
+            // path throws (e.g. stale IDB connection, broken handle, etc.)
+            try { await this.fs.restoreSession(); } catch {}
         } finally {
             this.#wakeRestoring = false;
             this.#lastHiddenAt = 0;
         }
+        // Force a repaint — ChromeOS can leave the compositor surface blank
+        // after system sleep; touching a layout property triggers a
+        // synchronous reflow + repaint so the user sees content immediately.
+        this.#forceRepaint();
         // Fallback: if app is in a broken state (no tabs but saved data exists),
         // schedule a deferred restoreSession() to recover
         this.#scheduleWakeRetry();
+    }
+    // Force a DOM repaint — works around ChromeOS blank-screen-after-wake
+    #forceRepaint() {
+        const el = document.documentElement;
+        el.style.display = 'none';
+        void el.offsetHeight;   // synchronous reflow
+        el.style.display = '';
     }
     #scheduleWakeRetry() {
         clearTimeout(this.#wakeRetryTimer);
