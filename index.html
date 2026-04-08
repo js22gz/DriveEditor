@@ -1468,6 +1468,8 @@ class FileManager {
             } else if (saved.status === 'needs-auth') {
                 this.#handlePendingAuth(saved.handle);
                 return;
+            } else {
+                this.tree.updateHeader();
             }
             if (!this.state.tabs.length) {
                 await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
@@ -1925,7 +1927,9 @@ class DirectoryTreeView {
         if (!this.#fileTree) {
             const msg = document.createElement('div');
             msg.style.cssText = 'padding:20px;color:#52525b;text-align:center;font-size:12px';
-            msg.textContent = 'No folder open';
+            msg.textContent = this.fs?.adapter?.isDrive
+                ? 'Click above to connect Google Drive'
+                : 'Click above to open a local folder';
             this.container.appendChild(msg);
             for (const lv of this.#linkedViews) lv.render();
             return;
