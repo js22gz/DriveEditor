@@ -91,9 +91,8 @@ window.LEGEND = `<!--
                   │     • _parseMeta() + getForFile(filename)
                   │     • renderTab() → sandboxed iframe + postMessage
                   │     • protocol:
-                  │         editor → ext: {type:'editor:load', content, filename}
-                  │         ext → editor: {type:'extension:save', content}
-                  │         ext → editor: {type:'extension:dirty'}
+                  │         editor → ext: {type:'editor:state', content, filename}
+                  │         ext → editor: {type:'extension:updated', content}
                   │
                   ├── TabManager
                   │     • static TAB_TYPES (welcome · legend · text · extension)
@@ -2093,7 +2092,7 @@ class ExtensionManager {
         const sendLoadMessage = () => {
             try {
                 iframe.contentWindow.postMessage({
-                    type: 'editor:load',
+                    type: 'editor:state',
                     content: tab.content || '',
                     filename: tab.name
                 }, '*');
@@ -3297,25 +3296,14 @@ bindEvents() {
     this.bindLifecycle();
 
     // ── EXTENSION → EDITOR COMMUNICATION ──
-    // Receives 'extension:dirty' and 'extension:save' from sandboxed iframes
+    // Receives 'extension:updated' from sandboxed iframes
     window.addEventListener('message', async e => {
         if (!e.data || typeof e.data !== 'object') return;
 
         const activeTab = this.state.getActiveTab();
         if (!activeTab || activeTab.type !== 'extension') return;
 
-        if (e.data.type === 'extension:dirty') {
-            if (TabManager.canTabBeDirty(activeTab.type)) {
-                activeTab.dirty = true;
-                if (activeTab.element) {
-                    const ind = activeTab.element.querySelector('.dirty-indicator');
-                    if (ind) ind.style.visibility = 'visible';
-                }
-                this.fs.scheduleSave();
-                this.updateEditorStatus(activeTab);
-            }
-        }
-        else if (e.data.type === 'extension:save') {
+        if (e.data.type === 'extension:updated') {
             activeTab.content = e.data.content || '';
             activeTab.dirty = true;
             await this.fs.saveTab(activeTab);
