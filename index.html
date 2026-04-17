@@ -2088,20 +2088,21 @@ class ExtensionManager {
         document.querySelector('.editor-wrapper').appendChild(iframe);
         tab.extFrame = iframe;
         iframe.srcdoc = tab.extension.html;
-        // Reliable delivery (srcdoc can be async)
+        // Close over the local `iframe` variable so the callback is still valid
+        // even if tab.extFrame is overwritten by a subsequent renderTab call.
         const sendLoadMessage = () => {
             try {
-                tab.extFrame.contentWindow.postMessage({
+                iframe.contentWindow.postMessage({
                     type: 'editor:load',
                     content: tab.content || '',
                     filename: tab.name
                 }, '*');
             } catch (e) {}
         };
-        tab.extFrame.onload = sendLoadMessage;
+        iframe.onload = sendLoadMessage;
         tab._extTimers = [
-            setTimeout(sendLoadMessage, 60), // fallback
-            setTimeout(sendLoadMessage, 180) // extra safety for CDNs
+            setTimeout(sendLoadMessage, 60),  // fallback
+            setTimeout(sendLoadMessage, 180)  // extra safety for CDNs
         ];
     }
 }
@@ -2161,6 +2162,12 @@ class TabManager {
             this.switchToTab(tab.id);
         };
     }
+    /** Replaces the .ext-toggle element in tab.element with a freshly created one. */
+    #replaceExtToggle(tab) {
+        if (!tab.element) return;
+        const old = tab.element.querySelector('.ext-toggle');
+        if (old) old.replaceWith(this.#createExtToggle(tab, tab.extension));
+    }
     #createExtToggle(tab, ext) {
         const extToggle = document.createElement('span');
         if (ext) {
@@ -2180,12 +2187,11 @@ class TabManager {
                     for (const t of this.state.tabs) {
                         if (t.extension && t.extension.name === ext.name) {
                             if (t.type === 'extension' && t.id === currentTabId) currentTabWasExtension = true;
+                            if (t._extTimers) { t._extTimers.forEach(c => clearTimeout(c)); t._extTimers = []; }
+                            if (t.extFrame) { t.extFrame.remove(); t.extFrame = null; }
                             t.extension = null;
                             if (t.type === 'extension') t.type = 'text';
-                            if (t.element) {
-                                const toggle = t.element.querySelector('.ext-toggle');
-                                if (toggle) toggle.replaceWith(this.#createExtToggle(t, null));
-                            }
+                            this.#replaceExtToggle(t);
                         }
                     }
                     if (currentTabWasExtension) {
@@ -2213,10 +2219,7 @@ class TabManager {
                     tab.extension = newExt;
                     if (this.state.currentTabId === tab.id) tab.content = this.textarea.value;
                     tab.type = 'extension';
-                    extToggle.textContent = newExt.name;
-                    extToggle.title = 'Toggle extension: ' + newExt.name;
-                    extToggle.className = 'ext-toggle active';
-                    extToggle.onclick = this.#makeExtToggleHandler(tab, extToggle);
+                    this.#replaceExtToggle(tab);
                     tab._pendingTypeSwitch = true;
                     this.switchToTab(tab.id);
                 }
@@ -2239,16 +2242,11 @@ class TabManager {
                         if (newType !== tab.type) {
                             tab.type = newType;
                             tab.extension = ext || null;
-                            if (tab.extFrame && newType === 'text') {
-                                tab.extFrame.remove();
-                                tab.extFrame = null;
+                            if (newType === 'text') {
+                                if (tab._extTimers) { tab._extTimers.forEach(c => clearTimeout(c)); tab._extTimers = []; }
+                                if (tab.extFrame) { tab.extFrame.remove(); tab.extFrame = null; }
                             }
-                            if (tab.element) {
-                                const existingToggle = tab.element.querySelector('.ext-toggle');
-                                if (existingToggle) existingToggle.remove();
-                                const extToggle = this.#createExtToggle(tab, ext || null);
-                                tab.element.insertBefore(extToggle, tab.element.querySelector('.tab-name'));
-                            }
+                            this.#replaceExtToggle(tab);
                         }
                     }
                 }
@@ -2382,6 +2380,7 @@ class TabManager {
         if (idx === -1) return;
         const tab = this.state.tabs[idx];
         if (tab.dirty && !await this.ui.showDialog({isConfirm: true, confirmMessage: `"${tab.name}" has unsaved changes. Close anyway?`})) return;
+        if (tab._extTimers) { tab._extTimers.forEach(c => clearTimeout(c)); tab._extTimers = []; }
         if (tab.extFrame) {
             tab.extFrame.remove();
             tab.extFrame = null;
@@ -3281,24 +3280,6 @@ class UIManager {
             const wasMobile = this.#isMobile;
             this.#isMobile = window.innerWidth <= 768;
             if (this.#isMobile && !wasMobile) this.#sidebarEl.classList.add('hidden');
-        });
-        window.addEventListener('message', e => {
-            if (!e.data || typeof e.data !== 'object') return;
-            const tab = this.state.tabs.find(t => t.type === 'extension' && t.extFrame && t.extFrame.contentWindow === e.source);
-            if (!tab) return;
-            if (e.data.type === 'extension:save') {
-                tab.content = e.data.content;
-                tab.dirty = true;
-                if (tab.element) tab.element.querySelector('.dirty-indicator').style.visibility = 'visible';
-                if (tab.id === this.state.currentTabId) {
-                    this.fs.scheduleSave();
-                } else {
-                    this.fs.saveTab(tab);
-                }
-            } else if (e.data.type === 'extension:dirty') {
-                tab.dirty = true;
-                if (tab.element) tab.element.querySelector('.dirty-indicator').style.visibility = 'visible';
-            }
         });
         window.addEventListener('beforeunload', e => {
             this.#snapshotState();
