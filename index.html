@@ -501,6 +501,21 @@ header:fullscreen { display: none; }
 }
 .ext-frame.hidden { display: none; }
 
+/* ── Split-mode layout ── */
+.editor-wrapper.split-mode { flex-direction: row; }
+.split-left-pane {
+  display: flex; flex-shrink: 0; overflow: hidden;
+  min-width: 100px; position: relative;
+}
+.split-resize-handle {
+  width: 5px; cursor: col-resize; background: transparent;
+  flex-shrink: 0; z-index: 6;
+}
+.split-resize-handle:hover { background: var(--border-subtle); }
+.editor-wrapper.split-mode .ext-frame {
+  position: static; flex: 1; min-width: 100px;
+}
+
 /* ────────────────────────────────────────────────────────
    9. UTILITIES & STATES
 ──────────────────────────────────────────────────────── */
@@ -1643,7 +1658,7 @@ class FileManager {
     async saveTab(tab) {
         if (!tab?.handle || !tab.dirty) return;
         try {
-            const content = (this.state.currentTabId === tab.id && tab.type !== 'extension')
+            const content = (this.state.currentTabId === tab.id && (tab.type !== 'extension' || tab.extension?.mode === 'split'))
                 ? this.#ui.textarea.value
                 : tab.content;
             await this.adapter.writeFile(tab.handle, content);
@@ -2010,7 +2025,7 @@ class ExtensionManager {
                         const html = await file.text();
                         const meta = this.#parseMeta(html);
                         if (meta) {
-                            this.extensions.push({ key: keys[i], name: meta.name, types: meta.types, handle, html });
+                            this.extensions.push({ key: keys[i], name: meta.name, types: meta.types, mode: meta.mode, handle, html });
                         }
                     } catch { }
                 }
@@ -2040,8 +2055,9 @@ class ExtensionManager {
                 existing.handle = fileHandle;
                 existing.html = html;
                 existing.types = meta.types;
+                existing.mode = meta.mode;
             } else {
-                this.extensions.push({ key: meta.name, name: meta.name, types: meta.types, handle: fileHandle, html });
+                this.extensions.push({ key: meta.name, name: meta.name, types: meta.types, mode: meta.mode, handle: fileHandle, html });
             }
             await this.fs.initDB();
             const tx = this.fs.db.transaction('extensions', 'readwrite');
@@ -2062,9 +2078,11 @@ class ExtensionManager {
         const nameMatch = html.match(/<meta\s+name=["']extension-name["']\s+content=["']([^"']+)["']/i);
         const typesMatch = html.match(/<meta\s+name=["']extension-types["']\s+content=["']([^"']+)["']/i);
         if (!nameMatch || !typesMatch) return null;
+        const modeMatch = html.match(/<meta\s+name=["']extension-mode["']\s+content=["']([^"']+)["']/i);
         return {
             name: nameMatch[1],
-            types: typesMatch[1].split(',').map(t => t.trim().toLowerCase())
+            types: typesMatch[1].split(',').map(t => t.trim().toLowerCase()),
+            mode: modeMatch ? modeMatch[1].trim().toLowerCase() : 'full'
         };
     }
     getForFile(filename) {
@@ -2339,13 +2357,15 @@ class TabManager {
         if (!skipSave && this.state.currentTabId !== null) {
             const cur = this.state.tabs.find(t => t.id === this.state.currentTabId);
             if (cur) {
-                if (cur.type !== 'extension') {
+                if (cur.type !== 'extension' || cur.extension?.mode === 'split') {
                     cur.content = this.textarea.value;
                     cur.scrollTop = this.textarea.scrollTop;
                 }
                 if (cur.dirty) this.fs.saveTab(cur);
             }
         }
+        // Clean up split layout before setting up new tab
+        this.#exitSplitMode();
         // Hide all per-tab extension iframes
         this.state.tabs.forEach(t => { if (t.extFrame) t.extFrame.classList.add('hidden'); });
         this.state.currentTabId = id;
@@ -2354,9 +2374,20 @@ class TabManager {
         tab.element.classList.add('active');
         const gutterUserHidden = localStorage.getItem('gutterVisible') === 'false';
         if (tab.type === 'extension') {
-            this.textarea.style.display = 'none';
-            if (!gutterUserHidden) this.gutter.style.display = 'none';
-            this.extensions.renderTab(tab);
+            if (tab.extension?.mode === 'split') {
+                // Split mode: show editor + extension side by side
+                this.textarea.style.display = '';
+                if (!gutterUserHidden) this.gutter.style.display = '';
+                this.textarea.value = tab.content || '';
+                this.textarea.readOnly = false;
+                this.#enterSplitMode();
+                this.extensions.renderTab(tab);
+            } else {
+                // Full mode: hide editor, show extension
+                this.textarea.style.display = 'none';
+                if (!gutterUserHidden) this.gutter.style.display = 'none';
+                this.extensions.renderTab(tab);
+            }
         } else {
             this.textarea.style.display = '';
             if (!gutterUserHidden) this.gutter.style.display = '';
@@ -2374,11 +2405,80 @@ class TabManager {
         }
         this.fs.saveOpenTabs(id);
     }
+    #enterSplitMode() {
+        const wrapper = document.querySelector('.editor-wrapper');
+        const leftPane = document.createElement('div');
+        leftPane.className = 'split-left-pane';
+        const savedWidth = localStorage.getItem('splitLeftWidth');
+        leftPane.style.width = savedWidth || '50%';
+        leftPane.appendChild(this.gutter);
+        leftPane.appendChild(this.textarea);
+        const splitter = document.createElement('div');
+        splitter.className = 'split-resize-handle';
+        const sidebarToggle = wrapper.querySelector('.sidebar-toggle');
+        if (sidebarToggle) {
+            sidebarToggle.after(leftPane, splitter);
+        } else {
+            wrapper.prepend(splitter);
+            wrapper.prepend(leftPane);
+        }
+        wrapper.classList.add('split-mode');
+        this.#bindSplitResize(splitter, leftPane);
+    }
+    #exitSplitMode() {
+        const wrapper = document.querySelector('.editor-wrapper');
+        if (!wrapper.classList.contains('split-mode')) return;
+        const splitter = wrapper.querySelector('.split-resize-handle');
+        if (splitter?._splitCleanup) splitter._splitCleanup();
+        const sidebarToggle = wrapper.querySelector('.sidebar-toggle');
+        if (sidebarToggle) {
+            sidebarToggle.after(this.gutter, this.textarea);
+        } else {
+            wrapper.prepend(this.textarea);
+            wrapper.prepend(this.gutter);
+        }
+        wrapper.querySelector('.split-left-pane')?.remove();
+        splitter?.remove();
+        wrapper.classList.remove('split-mode');
+    }
+    #bindSplitResize(splitter, leftPane) {
+        let resizing = false, startX = 0, startW = 0;
+        const onDown = e => {
+            resizing = true;
+            startX = e.clientX;
+            startW = leftPane.offsetWidth;
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        };
+        const onMove = e => {
+            if (!resizing) return;
+            const wrapperW = leftPane.parentElement.offsetWidth;
+            const w = Math.max(100, Math.min(wrapperW - 100, startW + e.clientX - startX));
+            leftPane.style.width = w + 'px';
+        };
+        const onUp = () => {
+            if (!resizing) return;
+            resizing = false;
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            localStorage.setItem('splitLeftWidth', leftPane.style.width);
+        };
+        splitter.addEventListener('mousedown', onDown);
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        splitter._splitCleanup = () => {
+            splitter.removeEventListener('mousedown', onDown);
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+        };
+    }
     async closeTab(id) {
         const idx = this.state.tabs.findIndex(t => t.id === id);
         if (idx === -1) return;
         const tab = this.state.tabs[idx];
         if (tab.dirty && !await this.ui.showDialog({isConfirm: true, confirmMessage: `"${tab.name}" has unsaved changes. Close anyway?`})) return;
+        if (tab.id === this.state.currentTabId) this.#exitSplitMode();
         if (tab._extTimers) { tab._extTimers.forEach(c => clearTimeout(c)); tab._extTimers = []; }
         if (tab.extFrame) {
             tab.extFrame.remove();
@@ -2780,7 +2880,7 @@ class UIManager {
     }
     updateEditorStatus(tab) {
         const modified = tab.dirty ? ' • Modified' : '';
-        if (tab.type === 'extension') {
+        if (tab.type === 'extension' && tab.extension?.mode !== 'split') {
             this.#statusEl.textContent = `${this.state.tabs.length} tab${this.state.tabs.length !== 1 ? 's' : ''}`;
         } else {
             const pos = this.#textarea.selectionStart || 0;
@@ -2978,6 +3078,16 @@ class UIManager {
                         this.fs.scheduleSave();
                     }
                     this.updateEditorStatus(tab);
+                    // Send editor:state to split-mode extension iframe
+                    if (tab.extension?.mode === 'split' && tab.extFrame) {
+                        try {
+                            tab.extFrame.contentWindow.postMessage({
+                                type: 'editor:state',
+                                content: this.#textarea.value,
+                                filename: tab.name
+                            }, '*');
+                        } catch (e) {}
+                    }
                 }
             } else if (this.state.currentDirHandle && this.#textarea.value && !this.#creatingUntitled) {
                 this.#creatingUntitled = true;
@@ -3138,7 +3248,7 @@ class UIManager {
     // Capture in-memory state to localStorage before the browser suspends the page
     #snapshotState() {
         const activeTab = this.state.getActiveTab();
-        if (activeTab && activeTab.type !== 'extension' && this.#textarea) {
+        if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && this.#textarea) {
             activeTab.content = this.#textarea.value;
             activeTab.scrollTop = this.#textarea.scrollTop;
         }
@@ -3163,7 +3273,7 @@ class UIManager {
         }
         // Refresh active non-dirty tab content from disk
         const activeTab = this.state.getActiveTab();
-        if (activeTab?.handle && activeTab.type !== 'extension' && !activeTab.dirty) {
+        if (activeTab?.handle && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && !activeTab.dirty) {
             try {
                 const file = await activeTab.handle.getFile();
                 const content = await file.text();
@@ -3190,7 +3300,7 @@ class UIManager {
             }
             // Verify visual state — ensure textarea shows active tab content
             const activeTab = this.state.getActiveTab();
-            if (activeTab && activeTab.type !== 'extension' && this.#textarea) {
+            if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && this.#textarea) {
                 if (this.#textarea.value !== (activeTab.content || '')) {
                     this.#textarea.value = activeTab.content || '';
                     this.updateLineNumbers(true);
@@ -3306,6 +3416,11 @@ bindEvents() {
         if (e.data.type === 'extension:updated') {
             activeTab.content = e.data.content || '';
             activeTab.dirty = true;
+            // In split mode, sync the textarea with the extension's content
+            if (activeTab.extension?.mode === 'split' && this.#textarea) {
+                this.#textarea.value = activeTab.content;
+                this.updateLineNumbers();
+            }
             await this.fs.saveTab(activeTab);
             this.updateEditorStatus(activeTab);
         }
