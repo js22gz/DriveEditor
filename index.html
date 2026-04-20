@@ -43,8 +43,10 @@ window.LEGEND = `<!--
                   │
                   ├── EventBus – minimal namespaced pub/sub
                   │     • on(event, fn) / off(event, fn) / emit(event, ...args)
-                  │     • namespaces: ui: fs: tab: tree: extension: restore:
-                  │     • decouples toasts, status updates, context-menu close
+                  │     • namespaces: ui: tree: restore: extension:
+                  │     • ui:dialog · ui:toast · ui:action-toast · ui:context-menu-close
+                  │     • ui:lines-update · ui:status-update · tree:highlight-active
+                  │     • restore:started · restore:permission-needed · restore:completed
                   │
                   ├── ReactiveState – Proxy<EventTarget>
                   │     • currentDirHandle, tabs[], currentTabId,
@@ -112,6 +114,7 @@ window.LEGEND = `<!--
                   │     • Permission re-validation with retry/backoff
                   │     • State snapshotting + tree rebuild + tab restore
                   │     • beforeunload guard (dirty-check + flush)
+                  │     • Emits restore:started / permission-needed / completed
                   │
                   ├── UIManager
                   │     • DOM wiring, context menu, long-press (mobile)
@@ -2187,7 +2190,6 @@ class TabManager {
         this.fs = fs;
         this.extensions = extensions;
         this.bus = bus;
-        /** @type {UIManager} */ this.ui = null;
         this.textarea = null;
         this.gutter = null;
         this.tabsContainer = null;
@@ -2243,7 +2245,7 @@ class TabManager {
                 longPressTriggered = false;
                 longPressTimer = setTimeout(async () => {
                     longPressTriggered = true;
-                    if (!await this.ui.showDialog({isConfirm: true, confirmMessage: `Uninstall extension "${ext.name}"?`, danger: true})) return;
+                    if (!await new Promise(r => this.bus.emit('ui:dialog', {isConfirm: true, confirmMessage: `Uninstall extension "${ext.name}"?`, danger: true}, r))) return;
                     await this.extensions.uninstall(ext.name);
                     const currentTabId = this.state.currentTabId;
                     let currentTabWasExtension = false;
@@ -2522,7 +2524,7 @@ class TabManager {
         const idx = this.state.tabs.findIndex(t => t.id === id);
         if (idx === -1) return;
         const tab = this.state.tabs[idx];
-        if (tab.dirty && !await this.ui.showDialog({isConfirm: true, confirmMessage: `"${tab.name}" has unsaved changes. Close anyway?`})) return;
+        if (tab.dirty && !await new Promise(r => this.bus.emit('ui:dialog', {isConfirm: true, confirmMessage: `"${tab.name}" has unsaved changes. Close anyway?`}, r))) return;
         if (tab.id === this.state.currentTabId) this.#exitSplitMode();
         if (tab._extTimers) { tab._extTimers.forEach(c => clearTimeout(c)); tab._extTimers = []; }
         if (tab.extFrame) {
@@ -2535,7 +2537,7 @@ class TabManager {
             this.state.currentTabId = null;
             this.textarea.value = '';
             this.gutter.replaceChildren();
-            this.ui.editorStatusEl.textContent = 'No file open';
+            this.bus.emit('ui:status-update', null);
             this.fs.saveOpenTabs(null);
             localStorage.removeItem('openTabs');
             return;
@@ -2617,16 +2619,14 @@ class SessionRestoreManager {
     #state;
     #fs;
     #tabs;
-    #tree;
     #ui;
     #extensions;
     #bus;
-    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {DirectoryTreeView} tree @param {UIManager} ui @param {ExtensionManager} extensions @param {EventBus} bus */
-    constructor(state, fs, tabs, tree, ui, extensions, bus) {
+    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {UIManager} ui @param {ExtensionManager} extensions @param {EventBus} bus */
+    constructor(state, fs, tabs, ui, extensions, bus) {
         this.#state = state;
         this.#fs = fs;
         this.#tabs = tabs;
-        this.#tree = tree;
         this.#ui = ui;
         this.#extensions = extensions;
         this.bus = bus;
@@ -2718,6 +2718,7 @@ class SessionRestoreManager {
             const perm = await this.#fs.queryPermission(this.#state.currentDirHandle);
             if (perm === 'granted') return true;
         }
+        this.bus.emit('restore:permission-needed');
         this.bus.emit('ui:action-toast', 'Tap to restore folder access', async () => {
             try {
                 const result = await this.#state.currentDirHandle.requestPermission({ mode: 'readwrite' });
@@ -2736,8 +2737,7 @@ class SessionRestoreManager {
     // ── Rebuild tree + restore missing tabs after wake ───
     async #wakeRebuild() {
         await this.#fs.mutateAndRebuild();
-        this.#tree.highlightActive();
-        // Re-attach extensions to any tabs that lost their association
+        this.bus.emit('tree:highlight-active');
         this.#tabs.reattachExtensions();
         // If tabs disappeared (page discarded mid-session), restore from localStorage
         if (!this.#state.tabs.length && this.#state.currentDirHandle) {
@@ -2767,6 +2767,7 @@ class SessionRestoreManager {
     async #wakeRestore() {
         if (this.#phase !== 'ready') return;
         this.#phase = 'restoring';
+        this.bus.emit('restore:started');
         try {
             // Ensure IndexedDB connection is still alive after sleep
             await IndexedDBHelper.ensureOpen();
@@ -2795,6 +2796,7 @@ class SessionRestoreManager {
         } finally {
             this.#phase = 'ready';
             this.#lastHiddenAt = 0;
+            this.bus.emit('restore:completed');
         }
         // Force a repaint — ChromeOS can leave the compositor surface blank
         // after system sleep; touching a layout property triggers a
@@ -2860,11 +2862,13 @@ class UIManager {
         this.#isMobile = window.innerWidth <= 768;
         /** @type {SessionRestoreManager} */ this.restore = null;
         // Subscribe to bus events – centralizes all fire-and-forget UI updates
+        bus.on('ui:dialog', (opts, resolve) => this.showDialog(opts).then(resolve));
         bus.on('ui:toast', (msg, dur) => this.showToast(msg, dur));
         bus.on('ui:action-toast', (msg, cb, dur) => this.showActionToast(msg, cb, dur));
         bus.on('ui:context-menu-close', () => this.closeContextMenu());
         bus.on('ui:lines-update', force => this.updateLineNumbers(force));
         bus.on('ui:status-update', tab => this.updateEditorStatus(tab));
+        bus.on('tree:highlight-active', () => this.tree.highlightActive());
     }
     get contextMenuTarget() { return this.#contextMenuTarget; }
     get isMobile() { return this.#isMobile; }
@@ -2874,7 +2878,6 @@ class UIManager {
     }
     get sidebarEl() { return this.#sidebarEl; }
     get textarea() { return this.#textarea; }
-    get editorStatusEl() { return this.#editorStatusEl; }
     async init() {
         this.#textarea = document.getElementById('textarea');
         this.#gutter = document.getElementById('gutter');
@@ -3173,6 +3176,11 @@ class UIManager {
         });
     }
     updateEditorStatus(tab) {
+        if (!tab) {
+            this.#statusEl.textContent = '';
+            this.#editorStatusEl.textContent = 'No file open';
+            return;
+        }
         const modified = tab.dirty ? ' • Modified' : '';
         if (tab.type === 'extension' && tab.extension?.mode !== 'split') {
             this.#statusEl.textContent = `${this.state.tabs.length} tab${this.state.tabs.length !== 1 ? 's' : ''}`;
@@ -3535,10 +3543,10 @@ bindEvents() {
             // In split mode, sync the textarea with the extension's content
             if (activeTab.extension?.mode === 'split' && this.#textarea) {
                 this.#textarea.value = activeTab.content;
-                this.updateLineNumbers();
+                this.bus.emit('ui:lines-update');
             }
             await this.fs.saveTab(activeTab);
-            this.updateEditorStatus(activeTab);
+            this.bus.emit('ui:status-update', activeTab);
         }
     });
 }
@@ -3561,7 +3569,7 @@ class EditorApp {
         this.extensions = new ExtensionManager(this.state, this.fs, this.bus);
         this.tabs = new TabManager(this.state, this.fs, this.extensions, this.bus);
         this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions, this.bus);
-        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.tree, this.ui, this.extensions, this.bus);
+        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.ui, this.extensions, this.bus);
         this.ui.restore = this.restore;
         this.#wireBackend(this.fs);
         this.#updateBackendBtn();
@@ -3570,7 +3578,6 @@ class EditorApp {
         fs.tree = this.tree;
         fs.tabs = this.tabs;
         fs.ui = this.ui;
-        this.tabs.ui = this.ui;
     }
     #setBackend(fs) {
         this.fs = fs;
