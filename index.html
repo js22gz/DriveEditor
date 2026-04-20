@@ -77,7 +77,7 @@ window.LEGEND = `<!--
                   │     • Full CRUD + drag & drop (move/copy/rename)
                   │     • Auto-save (debounce 750 ms) + flush
                   │     • #newItem() shared helper (newFile / newFolder)
-                  │     • Session restore (pageshow / visibilitychange in bindLifecycle)
+                  │     • Session persistence (save/loadOpenTabs, save/loadExpandedState, restoreSession)
                   │
                   ├── DirectoryTreeView
                   │     • nodeByPath Map + fileTree root
@@ -100,14 +100,21 @@ window.LEGEND = `<!--
                   │     • Drag-to-reorder tabs
                   │     • updateTabPaths() after rename/move
                   │
+                  ├── SessionRestoreManager
+                  │     • Phase state machine: idle → ready ↔ restoring
+                  │     • Lifecycle events (pageshow · freeze · resume · visibilitychange)
+                  │     • Heartbeat-based wake detection
+                  │     • Permission re-validation with retry/backoff
+                  │     • State snapshotting + tree rebuild + tab restore
+                  │     • beforeunload guard (dirty-check + flush)
+                  │
                   ├── UIManager
                   │     • DOM wiring, context menu, long-press (mobile)
                   │     • showToast / showDialog / showCreateDialog / updateLineNumbers
                   │     • #showModal() shared modal scaffold helper
                   │     • bindKeyboard() · bindTreeEvents() · bindTabEvents()
-                  │       bindSettings() · bindLifecycle()
+                  │       bindSettings()
                   │     • #bindTextarea() · #bindSlider() · #bindSettingsPopover()
-                  │     • #revalidatePermission() shared helper
                   │
                   └── EditorApp (orchestrator)
                         • wires all classes together
@@ -2560,6 +2567,228 @@ class TabManager {
     }
 }
 // ────────────────────────────────────────────────────────
+// SessionRestoreManager – wake / restore state machine
+// ────────────────────────────────────────────────────────
+class SessionRestoreManager {
+    // ── Phase: idle → ready ↔ restoring ──
+    #phase = 'idle';
+    // ── Wake detection ──
+    #lastHiddenAt = 0;
+    #wakeRetryTimer = null;
+    #lastHeartbeat = Date.now();
+    #heartbeatId = null;
+    // ── Dependencies ──
+    #state;
+    #fs;
+    #tabs;
+    #tree;
+    #ui;
+    #extensions;
+    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {DirectoryTreeView} tree @param {UIManager} ui @param {ExtensionManager} extensions */
+    constructor(state, fs, tabs, tree, ui, extensions) {
+        this.#state = state;
+        this.#fs = fs;
+        this.#tabs = tabs;
+        this.#tree = tree;
+        this.#ui = ui;
+        this.#extensions = extensions;
+    }
+    /** Allow mutable fs reference when backend switches */
+    set fs(v) { this.#fs = v; }
+    /** Bind lifecycle events and perform the initial session restore */
+    async init() {
+        this.#bind();
+        await this.#fs.restoreSession();
+        this.#phase = 'ready';
+    }
+    // ── Lifecycle event wiring ────────────────────────────
+    #bind() {
+        // Restore session when page returns from bfcache (back/forward nav)
+        window.addEventListener('pageshow', async (e) => {
+            if (!e.persisted) return;
+            await this.#wakeRestore();
+        });
+
+        // Save state eagerly when browser freezes the page (sleep, tab discard)
+        document.addEventListener('freeze', () => {
+            this.#lastHiddenAt = Date.now();
+            this.#snapshotState();
+        });
+
+        // Full restore when browser resumes a frozen page
+        document.addEventListener('resume', () => {
+            this.#wakeRestore();
+        });
+
+        // Save + re-validate when page visibility changes (lock-screen / tab switch / wake)
+        document.addEventListener('visibilitychange', async () => {
+            if (document.visibilityState !== 'visible') {
+                this.#lastHiddenAt = Date.now();
+                this.#snapshotState();
+                return;
+            }
+            await this.#wakeRestore();
+        });
+
+        // Fallback wake detection — some platforms do not fire visibilitychange
+        // reliably after sleep / power-saver mode.  A heartbeat timer detects
+        // long gaps (indicating the JS event-loop was paused) so we can restore
+        // even when no visibility event arrived.
+        this.#heartbeatId = setInterval(() => { this.#lastHeartbeat = Date.now(); }, 10_000);
+        window.addEventListener('focus', () => {
+            const heartbeatGap = Date.now() - this.#lastHeartbeat;
+            const hiddenElapsed = this.#lastHiddenAt ? Date.now() - this.#lastHiddenAt : 0;
+            if (heartbeatGap > 30_000 || hiddenElapsed > 5000) {
+                this.#lastHeartbeat = Date.now();
+                this.#wakeRestore();
+            }
+        });
+        window.addEventListener('beforeunload', e => {
+            this.#snapshotState();
+            if (this.#state.tabs.some(t => t.dirty)) {
+                e.preventDefault();
+                return e.returnValue = 'Unsaved changes will be lost';
+            }
+        });
+    }
+    // ── Capture in-memory state to localStorage ──────────
+    #snapshotState() {
+        const activeTab = this.#state.getActiveTab();
+        const textarea = this.#ui.textarea;
+        if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && textarea) {
+            activeTab.content = textarea.value;
+            activeTab.scrollTop = textarea.scrollTop;
+        }
+        if (this.#state.currentDirHandle) {
+            this.#fs.saveOpenTabs(this.#state.currentTabId);
+            this.#fs.saveExpandedState();
+        }
+        this.#fs.flushSave().catch(e => console.warn('Flush during snapshot failed', e));
+    }
+    // ── Permission re-validation with retry / backoff ────
+    async #revalidatePermission() {
+        if (!this.#state.currentDirHandle) {
+            await this.#fs.restoreSession();
+            return !!this.#state.currentDirHandle;
+        }
+        // On ChromeOS deep sleep the filesystem / network can take several
+        // seconds to become available again.  Try up to 3 times with
+        // increasing back-off before falling back to a user-gesture prompt.
+        const delays = [0, 1500, 3000];
+        for (const delay of delays) {
+            if (delay) await new Promise(r => setTimeout(r, delay));
+            const perm = await this.#fs.queryPermission(this.#state.currentDirHandle);
+            if (perm === 'granted') return true;
+        }
+        this.#ui.showActionToast('Tap to restore folder access', async () => {
+            try {
+                const result = await this.#state.currentDirHandle.requestPermission({ mode: 'readwrite' });
+                if (result === 'granted') {
+                    await this.#wakeRebuild();
+                    this.#ui.showToast('Folder access restored ✓');
+                } else {
+                    this.#ui.showToast('Access was not granted');
+                }
+            } catch {
+                this.#ui.showToast('Failed to restore access');
+            }
+        });
+        return false;
+    }
+    // ── Rebuild tree + restore missing tabs after wake ───
+    async #wakeRebuild() {
+        await this.#fs.mutateAndRebuild();
+        this.#tree.highlightActive();
+        // Re-attach extensions to any tabs that lost their association
+        this.#tabs.reattachExtensions();
+        // If tabs disappeared (page discarded mid-session), restore from localStorage
+        if (!this.#state.tabs.length && this.#state.currentDirHandle) {
+            const restored = await this.#tabs.restoreOpenTabs(this.#state.currentDirHandle);
+            if (restored) this.#ui.showToast(`Restored ${restored} tab${restored > 1 ? 's' : ''}`);
+            if (!this.#state.tabs.length) {
+                await this.#tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
+            }
+            return;
+        }
+        // Refresh active non-dirty tab content from disk
+        const activeTab = this.#state.getActiveTab();
+        const textarea = this.#ui.textarea;
+        if (activeTab?.handle && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && !activeTab.dirty) {
+            try {
+                const file = await activeTab.handle.getFile();
+                const content = await file.text();
+                activeTab.content = content;
+                if (this.#state.currentTabId === activeTab.id && textarea) {
+                    textarea.value = content;
+                    this.#ui.updateLineNumbers(true);
+                }
+            } catch (e) { console.warn('Refresh active tab on wake failed', e); }
+        }
+    }
+    // ── Centralized wake handler — phase-guarded ─────────
+    async #wakeRestore() {
+        if (this.#phase !== 'ready') return;
+        this.#phase = 'restoring';
+        try {
+            // Ensure IndexedDB connection is still alive after sleep
+            await IndexedDBHelper.ensureOpen();
+            // Re-load extensions so stale handles are refreshed
+            await this.#extensions.loadAll();
+            const permOk = await this.#revalidatePermission();
+            if (permOk && this.#state.currentDirHandle) {
+                // Small settle delay — some platforms need a moment after wake
+                await new Promise(r => setTimeout(r, 200));
+                await this.#wakeRebuild();
+            }
+            // Verify visual state — ensure textarea shows active tab content
+            const activeTab = this.#state.getActiveTab();
+            const textarea = this.#ui.textarea;
+            if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && textarea) {
+                if (textarea.value !== (activeTab.content || '')) {
+                    textarea.value = activeTab.content || '';
+                    this.#ui.updateLineNumbers(true);
+                }
+            }
+        } catch (e) {
+            console.warn('Wake restore failed', e);
+            // Fallback: attempt a full session restore when the primary wake
+            // path throws (e.g. stale IDB connection, broken handle, etc.)
+            try { await this.#fs.restoreSession(); } catch {}
+        } finally {
+            this.#phase = 'ready';
+            this.#lastHiddenAt = 0;
+        }
+        // Force a repaint — ChromeOS can leave the compositor surface blank
+        // after system sleep; touching a layout property triggers a
+        // synchronous reflow + repaint so the user sees content immediately.
+        this.#forceRepaint();
+        // Fallback: if app is in a broken state (no tabs but saved data exists),
+        // schedule a deferred restoreSession() to recover
+        this.#scheduleWakeRetry();
+    }
+    // Force a DOM repaint — works around ChromeOS blank-screen-after-wake
+    #forceRepaint() {
+        const el = document.documentElement;
+        el.style.display = 'none';
+        void el.offsetHeight;   // synchronous reflow
+        el.style.display = '';
+    }
+    #scheduleWakeRetry() {
+        clearTimeout(this.#wakeRetryTimer);
+        if (this.#state.tabs.length) return;
+        const hasSavedTabs = this.#fs.loadOpenTabs().length > 0;
+        if (!hasSavedTabs) return;
+        this.#wakeRetryTimer = setTimeout(async () => {
+            if (this.#state.tabs.length) return;
+            try {
+                await this.#fs.restoreSession();
+            } catch (e) {
+                console.warn('Wake retry restoreSession failed', e);
+            }
+        }, 3000);
+    }
+}
+// ────────────────────────────────────────────────────────
 // UIManager – DOM init, events & rendering
 // ────────────────────────────────────────────────────────
 class UIManager {
@@ -2582,12 +2811,6 @@ class UIManager {
     #lastLineCount = 1;
     #lineNumberRafId = null;
     #creatingUntitled = false;
-    #wakeRestoring = false;
-    #lastHiddenAt = 0;
-    #wakeRetryTimer = null;
-    #lastHeartbeat = Date.now();
-    #heartbeatId = null;
-    #initComplete = false;
 	    /** @param {ReactiveState} state @param {TabManager} tabs @param {DirectoryTreeView} tree @param {FileManager} fs @param {ExtensionManager} extensions */
     constructor(state, tabs, tree, fs, extensions) {
         this.state = state;
@@ -2596,6 +2819,7 @@ class UIManager {
         this.fs = fs;
         this.extensions = extensions;
         this.#isMobile = window.innerWidth <= 768;
+        /** @type {SessionRestoreManager} */ this.restore = null;
     }
     get contextMenuTarget() { return this.#contextMenuTarget; }
     get isMobile() { return this.#isMobile; }
@@ -2649,8 +2873,7 @@ class UIManager {
         }
         await this.fs.initDB();
         await this.extensions.loadAll();
-        await this.fs.restoreSession();
-        this.#initComplete = true;
+        await this.restore.init();
     }
     showToast(message, duration = 2800) {
         const t = document.createElement('div');
@@ -3241,199 +3464,17 @@ class UIManager {
         });
         document.getElementById('settings-font-reset').addEventListener('click', () => applyFontSize(DEFAULT_FONT_SIZE));
     }
-    // Returns true if permission is already granted, false if user action is needed
-    async #revalidatePermission() {
-        if (!this.state.currentDirHandle) {
-            await this.fs.restoreSession();
-            return !!this.state.currentDirHandle;
-        }
-        // On ChromeOS deep sleep the filesystem / network can take several
-        // seconds to become available again.  Try up to 3 times with
-        // increasing back-off before falling back to a user-gesture prompt.
-        const delays = [0, 1500, 3000];
-        for (const delay of delays) {
-            if (delay) await new Promise(r => setTimeout(r, delay));
-            const perm = await this.fs.queryPermission(this.state.currentDirHandle);
-            if (perm === 'granted') return true;
-        }
-        this.showActionToast('Tap to restore folder access', async () => {
-            try {
-                const result = await this.state.currentDirHandle.requestPermission({ mode: 'readwrite' });
-                if (result === 'granted') {
-                    await this.#wakeRebuild();
-                    this.showToast('Folder access restored ✓');
-                } else {
-                    this.showToast('Access was not granted');
-                }
-            } catch {
-                this.showToast('Failed to restore access');
-            }
-        });
-        return false;
-    }
-    // Capture in-memory state to localStorage before the browser suspends the page
-    #snapshotState() {
-        const activeTab = this.state.getActiveTab();
-        if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && this.#textarea) {
-            activeTab.content = this.#textarea.value;
-            activeTab.scrollTop = this.#textarea.scrollTop;
-        }
-        if (this.state.currentDirHandle) {
-            this.fs.saveOpenTabs(this.state.currentTabId);
-            this.fs.saveExpandedState();
-        }
-        this.fs.flushSave().catch(e => console.warn('Flush during snapshot failed', e));
-    }
-    // Rebuild tree and restore any missing tabs after wake
-    async #wakeRebuild() {
-        await this.fs.mutateAndRebuild();
-        this.tree.highlightActive();
-        // Re-attach extensions to any tabs that lost their association
-        this.tabs.reattachExtensions();
-        // If tabs disappeared (page discarded mid-session), restore from localStorage
-        if (!this.state.tabs.length && this.state.currentDirHandle) {
-            const restored = await this.tabs.restoreOpenTabs(this.state.currentDirHandle);
-            if (restored) this.showToast(`Restored ${restored} tab${restored > 1 ? 's' : ''}`);
-            if (!this.state.tabs.length) {
-                await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
-            }
-            return;
-        }
-        // Refresh active non-dirty tab content from disk
-        const activeTab = this.state.getActiveTab();
-        if (activeTab?.handle && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && !activeTab.dirty) {
-            try {
-                const file = await activeTab.handle.getFile();
-                const content = await file.text();
-                activeTab.content = content;
-                if (this.state.currentTabId === activeTab.id && this.#textarea) {
-                    this.#textarea.value = content;
-                    this.updateLineNumbers(true);
-                }
-            } catch (e) { console.warn('Refresh active tab on wake failed', e); }
-        }
-    }
-    // Centralized wake handler — guards against concurrent calls
-    async #wakeRestore() {
-        if (this.#wakeRestoring || !this.#initComplete) return;
-        this.#wakeRestoring = true;
-        try {
-            // Ensure IndexedDB connection is still alive after sleep
-            await IndexedDBHelper.ensureOpen();
-            // Re-load extensions so stale handles are refreshed
-            await this.extensions.loadAll();
-            const permOk = await this.#revalidatePermission();
-            if (permOk && this.state.currentDirHandle) {
-                // Small settle delay — some platforms need a moment after wake
-                await new Promise(r => setTimeout(r, 200));
-                await this.#wakeRebuild();
-            }
-            // Verify visual state — ensure textarea shows active tab content
-            const activeTab = this.state.getActiveTab();
-            if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && this.#textarea) {
-                if (this.#textarea.value !== (activeTab.content || '')) {
-                    this.#textarea.value = activeTab.content || '';
-                    this.updateLineNumbers(true);
-                }
-            }
-        } catch (e) {
-            console.warn('Wake restore failed', e);
-            // Fallback: attempt a full session restore when the primary wake
-            // path throws (e.g. stale IDB connection, broken handle, etc.)
-            try { await this.fs.restoreSession(); } catch {}
-        } finally {
-            this.#wakeRestoring = false;
-            this.#lastHiddenAt = 0;
-        }
-        // Force a repaint — ChromeOS can leave the compositor surface blank
-        // after system sleep; touching a layout property triggers a
-        // synchronous reflow + repaint so the user sees content immediately.
-        this.#forceRepaint();
-        // Fallback: if app is in a broken state (no tabs but saved data exists),
-        // schedule a deferred restoreSession() to recover
-        this.#scheduleWakeRetry();
-    }
-    // Force a DOM repaint — works around ChromeOS blank-screen-after-wake
-    #forceRepaint() {
-        const el = document.documentElement;
-        el.style.display = 'none';
-        void el.offsetHeight;   // synchronous reflow
-        el.style.display = '';
-    }
-    #scheduleWakeRetry() {
-        clearTimeout(this.#wakeRetryTimer);
-        if (this.state.tabs.length) return;
-        const hasSavedTabs = this.fs.loadOpenTabs().length > 0;
-        if (!hasSavedTabs) return;
-        this.#wakeRetryTimer = setTimeout(async () => {
-            if (this.state.tabs.length) return;
-            try {
-                await this.fs.restoreSession();
-            } catch (e) {
-                console.warn('Wake retry restoreSession failed', e);
-            }
-        }, 3000);
-    }
-    bindLifecycle() {
-        // Restore session when page returns from bfcache (back/forward nav)
-        window.addEventListener('pageshow', async (e) => {
-            if (!e.persisted) return;
-            await this.#wakeRestore();
-        });
-
-        // Save state eagerly when browser freezes the page (sleep, tab discard)
-        document.addEventListener('freeze', () => {
-            this.#lastHiddenAt = Date.now();
-            this.#snapshotState();
-        });
-
-        // Full restore when browser resumes a frozen page
-        document.addEventListener('resume', () => {
-            this.#wakeRestore();
-        });
-
-        // Save + re-validate when page visibility changes (lock-screen / tab switch / wake)
-        document.addEventListener('visibilitychange', async () => {
-            if (document.visibilityState !== 'visible') {
-                this.#lastHiddenAt = Date.now();
-                this.#snapshotState();
-                return;
-            }
-            await this.#wakeRestore();
-        });
-
-        // Fallback wake detection — some platforms do not fire visibilitychange
-        // reliably after sleep / power-saver mode.  A heartbeat timer detects
-        // long gaps (indicating the JS event-loop was paused) so we can restore
-        // even when no visibility event arrived.
-        this.#heartbeatId = setInterval(() => { this.#lastHeartbeat = Date.now(); }, 10_000);
-        window.addEventListener('focus', () => {
-            const heartbeatGap = Date.now() - this.#lastHeartbeat;
-            const hiddenElapsed = this.#lastHiddenAt ? Date.now() - this.#lastHiddenAt : 0;
-            if (heartbeatGap > 30_000 || hiddenElapsed > 5000) {
-                this.#lastHeartbeat = Date.now();
-                this.#wakeRestore();
-            }
-        });
-        window.addEventListener('resize', () => {
-            const wasMobile = this.#isMobile;
-            this.#isMobile = window.innerWidth <= 768;
-            if (this.#isMobile && !wasMobile) this.#sidebarEl.classList.add('hidden');
-        });
-        window.addEventListener('beforeunload', e => {
-            this.#snapshotState();
-            if (this.state.tabs.some(t => t.dirty)) {
-                e.preventDefault();
-                return e.returnValue = 'Unsaved changes will be lost';
-            }
-        });
-    }
+ 
 bindEvents() {
     this.bindKeyboard();
     this.bindTreeEvents();
     this.bindTabEvents();
     this.bindSettings();
-    this.bindLifecycle();
+    window.addEventListener('resize', () => {
+        const wasMobile = this.#isMobile;
+        this.#isMobile = window.innerWidth <= 768;
+        if (this.#isMobile && !wasMobile) this.#sidebarEl.classList.add('hidden');
+    });
 
     // ── EXTENSION → EDITOR COMMUNICATION ──
     // Receives 'extension:updated' from sandboxed iframes
@@ -3474,6 +3515,8 @@ class EditorApp {
         this.extensions = new ExtensionManager(this.state, this.fs);
         this.tabs = new TabManager(this.state, this.fs, this.extensions);
         this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions);
+        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.tree, this.ui, this.extensions);
+        this.ui.restore = this.restore;
         this.#wireBackend(this.fs);
         this.#updateBackendBtn();
     }
@@ -3490,6 +3533,7 @@ class EditorApp {
         this.tabs.fs = fs;
         this.ui.fs = fs;
         this.extensions.fs = fs;
+        this.restore.fs = fs;
         this.#wireBackend(fs);
         this.#updateBackendBtn();
         localStorage.setItem('activeBackend', fs === this.localFs ? 'local' : 'drive');
