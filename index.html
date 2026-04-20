@@ -41,6 +41,11 @@ window.LEGEND = `<!--
          │
          └── <script> (class-based architecture)
                   │
+                  ├── EventBus – minimal namespaced pub/sub
+                  │     • on(event, fn) / off(event, fn) / emit(event, ...args)
+                  │     • namespaces: ui: fs: tab: tree: extension: restore:
+                  │     • decouples toasts, status updates, context-menu close
+                  │
                   ├── ReactiveState – Proxy<EventTarget>
                   │     • currentDirHandle, tabs[], currentTabId,
                   │       expandedFolders, activeFilePath,
@@ -615,6 +620,34 @@ header:fullscreen { display: none; }
 // ────────────────────────────────────────────────────────
 // ReactiveState – observable state container
 // ────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────
+// EventBus – minimal namespaced pub/sub
+// Decouples cross-component communication (toasts, status
+// updates, context-menu lifecycle) so classes no longer
+// hold direct references to each other for fire-and-forget
+// calls. Namespaces: ui: fs: tab: tree: extension: restore:
+// ────────────────────────────────────────────────────────
+class EventBus {
+    #listeners = {};
+    on(event, fn) {
+        (this.#listeners[event] ||= []).push(fn);
+        return () => this.off(event, fn);
+    }
+    off(event, fn) {
+        const list = this.#listeners[event];
+        if (!list) return;
+        const filtered = list.filter(f => f !== fn);
+        if (filtered.length) this.#listeners[event] = filtered;
+        else delete this.#listeners[event];
+    }
+    emit(event, ...args) {
+        const list = this.#listeners[event];
+        if (list) for (const fn of list.slice()) fn(...args);
+    }
+}
+// ────────────────────────────────────────────────────────
+// ReactiveState – central observable state
+// ────────────────────────────────────────────────────────
 class ReactiveState extends EventTarget {
     constructor() {
         super();
@@ -753,7 +786,7 @@ class StorageAdapter {
     constructor(isDrive = false, pathUtils = null) {
         this.#isDrive = isDrive;
         this.pathUtils = pathUtils;
-        /** @type {UIManager} */ this.ui = null;
+        /** @type {EventBus} */ this.bus = null;
     }
     get isDrive() { return this.#isDrive; }
     get db() { return IndexedDBHelper.db; }
@@ -981,21 +1014,21 @@ class StorageAdapter {
         if (this.#isDrive) return err.message.includes('403') ? 'Reconnect Google account' : 'Save failed';
         return err.message.includes('permission') ? 'Re-authorize folder' : 'Save failed';
     }
-    showPendingAuthToast(ui, handle, onSuccess) {
+    showPendingAuthToast(bus, handle, onSuccess) {
         const label = this.#isDrive ? 'Tap to reconnect Google Account' : 'Tap to restore folder access';
         const successMsg = this.#isDrive ? 'Google Drive access restored ✓' : 'Folder access restored ✓';
-        ui.showActionToast(label, async () => {
+        bus.emit('ui:action-toast', label, async () => {
             try {
                 if (this.#isDrive) {
                     await this.ensurePermission(handle);
                 } else {
                     if (await handle.requestPermission({ mode: 'readwrite' }) !== 'granted') {
-                        return ui.showToast('Access was not granted');
+                        return bus.emit('ui:toast', 'Access was not granted');
                     }
                 }
                 await onSuccess(handle);
-                ui.showToast(successMsg);
-            } catch { ui.showToast('Failed to restore access'); }
+                bus.emit('ui:toast', successMsg);
+            } catch { bus.emit('ui:toast', 'Failed to restore access'); }
         }, 15000);
     }
 }
@@ -1227,7 +1260,7 @@ class DriveAdapter extends StorageAdapter {
         const data = await resp.json();
         return parseInt(data.size, 10) || 0;
     }
-    async pickFile() { this.ui.showToast('Use the file tree to open files from Google Drive'); return null; }
+    async pickFile() { this.bus.emit('ui:toast', 'Use the file tree to open files from Google Drive'); return null; }
     async openNodeInBrowser(node) {
         const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${node.handle.id}?fields=webViewLink`);
         if (!resp.ok) throw new Error('Failed to get link');
@@ -1332,10 +1365,12 @@ class FileManager {
     #restoring = false;
     #restoreStartedAt = 0;
     #ui = null;
-    /** @param {ReactiveState} state @param {StorageAdapter} adapter */
-    constructor(state, adapter) {
+    /** @param {ReactiveState} state @param {StorageAdapter} adapter @param {EventBus} bus */
+    constructor(state, adapter, bus) {
         this.state = state;
         this.adapter = adapter;
+        this.bus = bus;
+        this.adapter.bus = bus;
         /** @type {DirectoryTreeView} */ this.tree = null;
         /** @type {TabManager} */ this.tabs = null;
         this.scheduleSave = (() => {
@@ -1352,9 +1387,9 @@ class FileManager {
     }
     // Proxy db to adapter (used by ExtensionManager)
     get db() { return this.adapter.db; }
-    // Propagate ui to adapter when set (adapter needs ui for toasts in pickFile / showPendingAuthToast)
+    // ui is still needed for dialogs, textarea access, and contextMenuTarget
     get ui() { return this.#ui; }
-    set ui(v) { this.#ui = v; this.adapter.ui = v; }
+    set ui(v) { this.#ui = v; }
     // ── DB & persistence ──────────────────────────────────
     async initDB() { return this.adapter.initDB(); }
     async queryPermission(handle) { return this.adapter.queryPermission(handle); }
@@ -1401,7 +1436,7 @@ class FileManager {
             try {
                 await this.adapter.ensurePermission(this.state.currentDirHandle);
             } catch {
-                this.#ui.showToast(this.adapter.permissionDeniedMsg, 4000);
+                this.bus.emit('ui:toast', this.adapter.permissionDeniedMsg, 4000);
                 return;
             }
         }
@@ -1485,7 +1520,7 @@ class FileManager {
                 this.tree.render();
                 this.tree.updateHeader();
                 const restored = await this.tabs.restoreOpenTabs(saved.handle);
-                if (restored) this.#ui.showToast(`Restored ${restored} tab${restored > 1 ? 's' : ''}`);
+                if (restored) this.bus.emit('ui:toast', `Restored ${restored} tab${restored > 1 ? 's' : ''}`);
             } else if (saved.status === 'needs-auth') {
                 this.#handlePendingAuth(saved.handle);
                 return;
@@ -1507,7 +1542,7 @@ class FileManager {
     }
     #handlePendingAuth(handle) {
         const pendingTabs = this.loadOpenTabs();
-        this.adapter.showPendingAuthToast(this.#ui, handle, async (h) => {
+        this.adapter.showPendingAuthToast(this.bus, handle, async (h) => {
             this.state.currentDirHandle = h;
             await this.build(h);
             this.loadExpandedState();
@@ -1521,7 +1556,7 @@ class FileManager {
                 this.state.tabs.splice(welcomeIdx, 1);
             }
             const restored = await this.tabs.restoreOpenTabs(h, pendingTabs);
-            if (restored) this.#ui.showToast(`Restored ${restored} tab${restored > 1 ? 's' : ''}`);
+            if (restored) this.bus.emit('ui:toast', `Restored ${restored} tab${restored > 1 ? 's' : ''}`);
             else if (!this.state.tabs.length) {
                 await this.tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
             }
@@ -1547,10 +1582,10 @@ class FileManager {
             await this.build(rootHandle);
             this.tree.render();
             this.tree.updateHeader();
-            this.#ui.showToast(this.adapter.connectSuccessMsg);
+            this.bus.emit('ui:toast', this.adapter.connectSuccessMsg);
         } catch (e) {
             if (!this.adapter.isAbortError(e)) {
-                this.#ui.showToast(this.adapter.connectionFailedMsg);
+                this.bus.emit('ui:toast', this.adapter.connectionFailedMsg);
             }
         }
     }
@@ -1568,7 +1603,7 @@ class FileManager {
             }
             await this.tabs.createNewTab(handle, name, content);
         } catch (e) {
-            if (e.name !== 'AbortError') this.#ui.showToast('File too large or unreadable as text');
+            if (e.name !== 'AbortError') this.bus.emit('ui:toast', 'File too large or unreadable as text');
         }
     }
     async openFileFromNode(node) {
@@ -1581,14 +1616,14 @@ class FileManager {
                 this.#ui.toggleSidebar();
             }
         } catch (e) {
-            this.#ui.showToast(this.adapter.getReadErrorMsg(e));
+            this.bus.emit('ui:toast', this.adapter.getReadErrorMsg(e));
         }
     }
     async openInBrowser(node) {
         try {
             await this.adapter.openNodeInBrowser(node);
         } catch (e) {
-            this.#ui.showToast('Failed to open file in browser');
+            this.bus.emit('ui:toast', 'Failed to open file in browser');
         }
     }
     // ── Target directory ──────────────────────────────────
@@ -1612,14 +1647,14 @@ class FileManager {
                 await this.adapter.createFolder(trimmed, dirCtx);
                 if (targetPath) { this.state.expandedFolders.add(targetPath); this.saveExpandedState(); }
                 await this.mutateAndRebuild();
-                this.#ui.showToast('Folder created');
+                this.bus.emit('ui:toast', 'Folder created');
             }
         } catch (e) {
-            this.#ui.showToast(this.adapter.formatError(kind === 'file' ? 'Create file' : 'Create folder', e));
+            this.bus.emit('ui:toast', this.adapter.formatError(kind === 'file' ? 'Create file' : 'Create folder', e));
         }
     }
     async #newItem(kind) {
-        if (!this.state.currentDirHandle) return this.#ui.showToast(this.adapter.notConnectedMsg);
+        if (!this.state.currentDirHandle) return this.bus.emit('ui:toast', this.adapter.notConnectedMsg);
         const isFile = kind === 'file';
         const activePath = this.state.activeDirectoryPaths[this.state.lastActivePane] || '';
         const rootName = this.state.currentDirHandle.name;
@@ -1628,20 +1663,20 @@ class FileManager {
         if (!name?.trim()) return;
         const trimmed = name.trim();
         if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
-            return this.#ui.showToast(isFile ? 'Invalid filename' : 'Invalid folder name');
+            return this.bus.emit('ui:toast', isFile ? 'Invalid filename' : 'Invalid folder name');
         const { dirCtx, targetPath } = await this.#getTargetDir();
         await this.#createItem(kind, trimmed, dirCtx, targetPath);
-        this.#ui.closeContextMenu();
+        this.bus.emit('ui:context-menu-close');
     }
     async newFile() { return this.#newItem('file'); }
     async newFolder() { return this.#newItem('folder'); }
     async createFromDialog() {
-        if (!this.state.currentDirHandle) return this.#ui.showToast(this.adapter.notConnectedMsg);
+        if (!this.state.currentDirHandle) return this.bus.emit('ui:toast', this.adapter.notConnectedMsg);
         const result = await this.#ui.showCreateDialog();
         if (!result) return;
         const { kind, name: trimmed } = result;
         if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
-            return this.#ui.showToast(kind === 'file' ? 'Invalid filename' : 'Invalid folder name');
+            return this.bus.emit('ui:toast', kind === 'file' ? 'Invalid filename' : 'Invalid folder name');
         const { dirCtx, targetPath } = await this.#getTargetDir();
         await this.#createItem(kind, trimmed, dirCtx, targetPath);
     }
@@ -1672,9 +1707,9 @@ class FileManager {
             tab.content = content;
             tab.dirty = false;
             if (tab.element) tab.element.querySelector('.dirty-indicator').style.visibility = 'hidden';
-            this.#ui.updateEditorStatus(tab);
+            this.bus.emit('ui:status-update', tab);
         } catch (err) {
-            this.#ui.showToast(this.adapter.getSaveErrorMsg(err));
+            this.bus.emit('ui:toast', this.adapter.getSaveErrorMsg(err));
         }
     }
     saveCurrentFile() {
@@ -1695,7 +1730,7 @@ class FileManager {
         const target = this.#ui.contextMenuTarget;
         if (!target || target.kind !== 'file') return;
         if (!await this.#ui.showDialog({ isConfirm: true, confirmMessage: `Delete "${target.name}"?`, danger: true })) {
-            this.#ui.closeContextMenu(); return;
+            this.bus.emit('ui:context-menu-close'); return;
         }
         try {
             for (const tab of this.state.tabs) {
@@ -1706,11 +1741,11 @@ class FileManager {
             }
             await this.adapter.deleteFileEntry(target, this.state.currentDirHandle);
             await this.mutateAndRebuild();
-            this.#ui.showToast('File deleted');
+            this.bus.emit('ui:toast', 'File deleted');
         } catch {
-            this.#ui.showToast('Delete failed');
+            this.bus.emit('ui:toast', 'Delete failed');
         }
-        this.#ui.closeContextMenu();
+        this.bus.emit('ui:context-menu-close');
     }
     async deleteFolder() {
         const target = this.#ui.contextMenuTarget;
@@ -1719,17 +1754,17 @@ class FileManager {
         const confirmed = isNonEmpty
             ? (await this.#ui.showDialog({ promptTitle: `Type "remove" to delete non-empty folder "${target.name}":` }) || '').trim().toLowerCase() === 'remove'
             : await this.#ui.showDialog({ isConfirm: true, confirmMessage: `Delete folder "${target.name}"?`, danger: true });
-        if (!confirmed) { this.#ui.closeContextMenu(); return; }
+        if (!confirmed) { this.bus.emit('ui:context-menu-close'); return; }
         try {
             await this.adapter.deleteFolderEntry(target, this.state.currentDirHandle);
             this.state.expandedFolders.delete(target.path);
             this.saveExpandedState();
             await this.mutateAndRebuild();
-            this.#ui.showToast('Folder deleted');
+            this.bus.emit('ui:toast', 'Folder deleted');
         } catch {
-            this.#ui.showToast('Delete failed');
+            this.bus.emit('ui:toast', 'Delete failed');
         }
-        this.#ui.closeContextMenu();
+        this.bus.emit('ui:context-menu-close');
     }
     // ── Rename ────────────────────────────────────────────
     async renameItem() {
@@ -1739,10 +1774,10 @@ class FileManager {
             promptTitle: `Rename ${target.kind}:`,
             defaultValue: target.name
         });
-        if (!newName?.trim() || newName === target.name) { this.#ui.closeContextMenu(); return; }
+        if (!newName?.trim() || newName === target.name) { this.bus.emit('ui:context-menu-close'); return; }
         const trimmed = newName.trim();
         if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed)) {
-            this.#ui.showToast('Invalid name'); this.#ui.closeContextMenu(); return;
+            this.bus.emit('ui:toast', 'Invalid name'); this.bus.emit('ui:context-menu-close'); return;
         }
         try {
             const oldPath = target.path;
@@ -1751,24 +1786,24 @@ class FileManager {
             await this.mutateAndRebuild();
             // Notify tab-related listeners of possible path changes
             this.state.notify('tabs');
-            this.#ui.showToast(`Renamed to ${trimmed}`);
+            this.bus.emit('ui:toast', `Renamed to ${trimmed}`);
         } catch (err) {
-            this.#ui.showToast(this.adapter.formatError('Rename', err), 4000);
+            this.bus.emit('ui:toast', this.adapter.formatError('Rename', err), 4000);
         }
-        this.#ui.closeContextMenu();
+        this.bus.emit('ui:context-menu-close');
     }
     // ── Move & Copy ───────────────────────────────────────
     async moveEntry(srcPath, destFolderPath = '') {
         const srcNode = this.tree.getNode(srcPath);
         if (!srcNode) return;
         if (srcNode.kind === 'directory' && destFolderPath.startsWith(srcPath + '/')) {
-            return this.#ui.showToast('Cannot move folder into itself');
+            return this.bus.emit('ui:toast', 'Cannot move folder into itself');
         }
         try {
             const destNode = this.tree.getNode(destFolderPath || '/');
-            if (!destNode) return this.#ui.showToast('Destination folder not found');
+            if (!destNode) return this.bus.emit('ui:toast', 'Destination folder not found');
             if (await this.adapter.existsInDir(destNode, srcNode.name)) {
-                return this.#ui.showToast(`"${srcNode.name}" already exists in destination`);
+                return this.bus.emit('ui:toast', `"${srcNode.name}" already exists in destination`);
             }
             await this.adapter.moveEntryImpl(srcNode, destNode, this.state.currentDirHandle);
             const newPath = destFolderPath ? `${destFolderPath}/${srcNode.name}` : srcNode.name;
@@ -1780,18 +1815,18 @@ class FileManager {
             await this.mutateAndRebuild();
             // Notify tab-related listeners of possible path changes
             this.state.notify('tabs');
-            this.#ui.showToast(`Moved "${srcNode.name}"`);
+            this.bus.emit('ui:toast', `Moved "${srcNode.name}"`);
         } catch (e) {
-            this.#ui.showToast(this.adapter.formatError('Move', e), 4000);
+            this.bus.emit('ui:toast', this.adapter.formatError('Move', e), 4000);
         }
-        this.#ui.closeContextMenu();
+        this.bus.emit('ui:context-menu-close');
     }
     async copyEntry(srcNode, destFolderPath) {
         const destNode = this.tree.getNode(destFolderPath || '/');
-        if (!destNode) return this.#ui.showToast('Destination folder not found');
+        if (!destNode) return this.bus.emit('ui:toast', 'Destination folder not found');
         try {
             if (await this.adapter.existsInDir(destNode, srcNode.name)) {
-                return this.#ui.showToast(`"${srcNode.name}" already exists in destination`);
+                return this.bus.emit('ui:toast', `"${srcNode.name}" already exists in destination`);
             }
             await this.adapter.copyEntryImpl(srcNode, destNode);
             if (destFolderPath) {
@@ -1801,11 +1836,11 @@ class FileManager {
             await this.mutateAndRebuild();
             // Notify tab-related listeners of possible path changes
             this.state.notify('tabs');
-            this.#ui.showToast(`Copied "${srcNode.name}"`);
+            this.bus.emit('ui:toast', `Copied "${srcNode.name}"`);
         } catch (e) {
-            this.#ui.showToast(this.adapter.formatError('Copy', e), 4000);
+            this.bus.emit('ui:toast', this.adapter.formatError('Copy', e), 4000);
         }
-        this.#ui.closeContextMenu();
+        this.bus.emit('ui:context-menu-close');
     }
     async isSameEntry(h1, h2) { return this.adapter.isSameEntry(h1, h2); }
 }
@@ -2004,11 +2039,11 @@ class DirectoryTreeView {
 // ────────────────────────────────────────────────────────
 class ExtensionManager {
     extensions = [];
-    /** @param {ReactiveState} state @param {FileManager} fs */
-    constructor(state, fs) {
+    /** @param {ReactiveState} state @param {FileManager} fs @param {EventBus} bus */
+    constructor(state, fs, bus) {
         this.state = state;
         this.fs = fs;
-        /** @type {UIManager} */ this.ui = null;
+        this.bus = bus;
     }
     async loadAll() {
         await this.fs.initDB();
@@ -2048,13 +2083,13 @@ class ExtensionManager {
             });
             const file = await fileHandle.getFile();
             if (!file.name.endsWith('-extension.html')) {
-                this.ui.showToast('Extension files must be named *-extension.html');
+                this.bus.emit('ui:toast', 'Extension files must be named *-extension.html');
                 return;
             }
             const html = await file.text();
             const meta = this.#parseMeta(html);
             if (!meta) {
-                this.ui.showToast('Missing extension-name or extension-types meta tags');
+                this.bus.emit('ui:toast', 'Missing extension-name or extension-types meta tags');
                 return;
             }
             const existing = this.extensions.find(e => e.name === meta.name);
@@ -2069,9 +2104,9 @@ class ExtensionManager {
             await this.fs.initDB();
             const tx = this.fs.db.transaction('extensions', 'readwrite');
             tx.objectStore('extensions').put(fileHandle, meta.name);
-            this.ui.showToast(`Extension "${meta.name}" installed (${meta.types.join(', ')})`);
+            this.bus.emit('ui:toast', `Extension "${meta.name}" installed (${meta.types.join(', ')})`);
         } catch (e) {
-            if (e.name !== 'AbortError') this.ui.showToast('Extension install cancelled or failed');
+            if (e.name !== 'AbortError') this.bus.emit('ui:toast', 'Extension install cancelled or failed');
         }
     }
     async uninstall(name) {
@@ -2079,7 +2114,7 @@ class ExtensionManager {
         await this.fs.initDB();
         const tx = this.fs.db.transaction('extensions', 'readwrite');
         tx.objectStore('extensions').delete(name);
-        this.ui.showToast(`Extension "${name}" removed`);
+        this.bus.emit('ui:toast', `Extension "${name}" removed`);
     }
     #parseMeta(html) {
         const nameMatch = html.match(/<meta\s+name=["']extension-name["']\s+content=["']([^"']+)["']/i);
@@ -2146,11 +2181,12 @@ class TabManager {
     /** Returns true when a tab of the given type can be marked dirty/modified */
     static canTabBeDirty(type) { return TabManager.#TAB_TYPES[type]?.canDirty ?? false; }
     #nextTabId = 1;
-    /** @param {ReactiveState} state @param {FileManager} fs @param {ExtensionManager} extensions */
-    constructor(state, fs, extensions) {
+    /** @param {ReactiveState} state @param {FileManager} fs @param {ExtensionManager} extensions @param {EventBus} bus */
+    constructor(state, fs, extensions, bus) {
         this.state = state;
         this.fs = fs;
         this.extensions = extensions;
+        this.bus = bus;
         /** @type {UIManager} */ this.ui = null;
         this.textarea = null;
         this.gutter = null;
@@ -2403,12 +2439,12 @@ class TabManager {
             this.textarea.value = tab.content || '';
             this.textarea.readOnly = !TabManager.#TAB_TYPES[tab.type]?.canDirty;
         }
-        this.ui.updateLineNumbers(true);
+        this.bus.emit('ui:lines-update', true);
         if (tab.scrollTop !== undefined) {
             this.textarea.scrollTop = tab.scrollTop;
             this.gutter.scrollTop = tab.scrollTop;
         }
-        this.ui.updateEditorStatus(tab);
+        this.bus.emit('ui:status-update', tab);
         if (tab.path) {
             this.state.activeFilePath = tab.path;
         }
@@ -2584,14 +2620,16 @@ class SessionRestoreManager {
     #tree;
     #ui;
     #extensions;
-    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {DirectoryTreeView} tree @param {UIManager} ui @param {ExtensionManager} extensions */
-    constructor(state, fs, tabs, tree, ui, extensions) {
+    #bus;
+    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {DirectoryTreeView} tree @param {UIManager} ui @param {ExtensionManager} extensions @param {EventBus} bus */
+    constructor(state, fs, tabs, tree, ui, extensions, bus) {
         this.#state = state;
         this.#fs = fs;
         this.#tabs = tabs;
         this.#tree = tree;
         this.#ui = ui;
         this.#extensions = extensions;
+        this.bus = bus;
     }
     /** Allow mutable fs reference when backend switches */
     set fs(v) { this.#fs = v; }
@@ -2680,17 +2718,17 @@ class SessionRestoreManager {
             const perm = await this.#fs.queryPermission(this.#state.currentDirHandle);
             if (perm === 'granted') return true;
         }
-        this.#ui.showActionToast('Tap to restore folder access', async () => {
+        this.bus.emit('ui:action-toast', 'Tap to restore folder access', async () => {
             try {
                 const result = await this.#state.currentDirHandle.requestPermission({ mode: 'readwrite' });
                 if (result === 'granted') {
                     await this.#wakeRebuild();
-                    this.#ui.showToast('Folder access restored ✓');
+                    this.bus.emit('ui:toast', 'Folder access restored ✓');
                 } else {
-                    this.#ui.showToast('Access was not granted');
+                    this.bus.emit('ui:toast', 'Access was not granted');
                 }
             } catch {
-                this.#ui.showToast('Failed to restore access');
+                this.bus.emit('ui:toast', 'Failed to restore access');
             }
         });
         return false;
@@ -2704,7 +2742,7 @@ class SessionRestoreManager {
         // If tabs disappeared (page discarded mid-session), restore from localStorage
         if (!this.#state.tabs.length && this.#state.currentDirHandle) {
             const restored = await this.#tabs.restoreOpenTabs(this.#state.currentDirHandle);
-            if (restored) this.#ui.showToast(`Restored ${restored} tab${restored > 1 ? 's' : ''}`);
+            if (restored) this.bus.emit('ui:toast', `Restored ${restored} tab${restored > 1 ? 's' : ''}`);
             if (!this.#state.tabs.length) {
                 await this.#tabs.createNewTab(null, 'welcome.txt', window.WELCOME, null, 'welcome');
             }
@@ -2720,7 +2758,7 @@ class SessionRestoreManager {
                 activeTab.content = content;
                 if (this.#state.currentTabId === activeTab.id && textarea) {
                     textarea.value = content;
-                    this.#ui.updateLineNumbers(true);
+                    this.bus.emit('ui:lines-update', true);
                 }
             } catch (e) { console.warn('Refresh active tab on wake failed', e); }
         }
@@ -2746,7 +2784,7 @@ class SessionRestoreManager {
             if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && textarea) {
                 if (textarea.value !== (activeTab.content || '')) {
                     textarea.value = activeTab.content || '';
-                    this.#ui.updateLineNumbers(true);
+                    this.bus.emit('ui:lines-update', true);
                 }
             }
         } catch (e) {
@@ -2811,15 +2849,22 @@ class UIManager {
     #lastLineCount = 1;
     #lineNumberRafId = null;
     #creatingUntitled = false;
-	    /** @param {ReactiveState} state @param {TabManager} tabs @param {DirectoryTreeView} tree @param {FileManager} fs @param {ExtensionManager} extensions */
-    constructor(state, tabs, tree, fs, extensions) {
+	    /** @param {ReactiveState} state @param {TabManager} tabs @param {DirectoryTreeView} tree @param {FileManager} fs @param {ExtensionManager} extensions @param {EventBus} bus */
+    constructor(state, tabs, tree, fs, extensions, bus) {
         this.state = state;
         this.tabs = tabs;
         this.tree = tree;
         this.fs = fs;
         this.extensions = extensions;
+        this.bus = bus;
         this.#isMobile = window.innerWidth <= 768;
         /** @type {SessionRestoreManager} */ this.restore = null;
+        // Subscribe to bus events – centralizes all fire-and-forget UI updates
+        bus.on('ui:toast', (msg, dur) => this.showToast(msg, dur));
+        bus.on('ui:action-toast', (msg, cb, dur) => this.showActionToast(msg, cb, dur));
+        bus.on('ui:context-menu-close', () => this.closeContextMenu());
+        bus.on('ui:lines-update', force => this.updateLineNumbers(force));
+        bus.on('ui:status-update', tab => this.updateEditorStatus(tab));
     }
     get contextMenuTarget() { return this.#contextMenuTarget; }
     get isMobile() { return this.#isMobile; }
@@ -3504,18 +3549,19 @@ bindEvents() {
 class EditorApp {
     constructor() {
         this.state = new ReactiveState();
+        this.bus = new EventBus();
         this.pathUtils = new PathUtils();
-        this.driveFs = new FileManager(this.state, new DriveAdapter());
-        this.localFs = new FileManager(this.state, new LocalAdapter(this.pathUtils));
+        this.driveFs = new FileManager(this.state, new DriveAdapter(), this.bus);
+        this.localFs = new FileManager(this.state, new LocalAdapter(this.pathUtils), this.bus);
         // Restore last-used backend; default to Google Drive for new users
         const saved = localStorage.getItem('activeBackend');
         this.fs = (saved === 'local' && 'showDirectoryPicker' in window)
             ? this.localFs : this.driveFs;
         this.tree = new DirectoryTreeView('tree-container', this.state, this.fs, 'left');
-        this.extensions = new ExtensionManager(this.state, this.fs);
-        this.tabs = new TabManager(this.state, this.fs, this.extensions);
-        this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions);
-        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.tree, this.ui, this.extensions);
+        this.extensions = new ExtensionManager(this.state, this.fs, this.bus);
+        this.tabs = new TabManager(this.state, this.fs, this.extensions, this.bus);
+        this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions, this.bus);
+        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.tree, this.ui, this.extensions, this.bus);
         this.ui.restore = this.restore;
         this.#wireBackend(this.fs);
         this.#updateBackendBtn();
@@ -3524,7 +3570,6 @@ class EditorApp {
         fs.tree = this.tree;
         fs.tabs = this.tabs;
         fs.ui = this.ui;
-        this.extensions.ui = this.ui;
         this.tabs.ui = this.ui;
     }
     #setBackend(fs) {
