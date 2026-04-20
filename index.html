@@ -31,7 +31,7 @@ window.LEGEND = `<!--
          │   ├── #sidebar-resize (draggable)
          │   └── .editor-area
          │       ├── #tabs (draggable tab strip)
-         │       │   └── #tab-settings-wrap (⛭ button + popover: slider · gutter · font ±)
+         │       │   └── #tab-settings-wrap (⛭ button → opens/focuses settings tab)
          │       ├── #line-width-slider (24–200 ch or ∞)
          │       ├── .editor-wrapper
          │       │   ├── button#sidebar-toggle
@@ -102,7 +102,7 @@ window.LEGEND = `<!--
                   │         ext → editor: {type:'extension:updated', content}
                   │
                   ├── TabManager
-                  │     • static TAB_TYPES (welcome · legend · text · extension)
+                  │     • static TAB_TYPES (welcome · legend · text · extension · settings)
                   │     • createNewTab() + switchToTab() + closeTab()
                   │     • Drag-to-reorder tabs
                   │     • updateTabPaths() after rename/move
@@ -123,6 +123,7 @@ window.LEGEND = `<!--
                   │     • bindKeyboard() · bindTreeEvents() · bindTabEvents()
                   │       bindSettings()
                   │     • #bindTextarea() · #bindSlider() · #bindSettingsPopover()
+                  │     • #applyFontSize() · #renderSettingsPanel()
                   │
                   └── EditorApp (orchestrator)
                         • wires all classes together
@@ -363,23 +364,23 @@ header:fullscreen { display: none; }
 }
 #tab-settings-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 
-#tab-settings-popover {
-  position: fixed; display: flex; flex-direction: column; gap: 4px;
-  padding: 6px; background: var(--bg-surface); border: 1px solid var(--border-color);
-  border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); z-index: 1000;
+#settings-panel {
+  position: absolute; inset: 0; background: var(--bg-editor);
+  overflow-y: auto; z-index: 5; padding: 24px 28px;
+  font-size: 13px; color: var(--text-secondary);
 }
-#tab-settings-popover.hidden { display: none; }
-
-.settings-btn {
-  background: var(--bg-base); border: 1px solid var(--border-color);
-  color: var(--text-secondary); font-size: 11px; font-family: ui-monospace, monospace;
-  cursor: pointer; width: 34px; height: 34px; display: flex; align-items: center;
-  justify-content: center; border-radius: 3px; transition: background 0.15s, color 0.15s;
-  flex-shrink: 0;
-}
-.settings-btn:hover { background: var(--border-color); color: var(--text-primary); }
-.settings-btn.active { background: var(--bg-active); color: var(--text-strong); border-color: var(--border-subtle); }
-#settings-toggle-ext:not(.active) { text-decoration: line-through; }
+#settings-panel.hidden { display: none; }
+.sp-section { margin-bottom: 24px; }
+.sp-label { font-size: 11px; letter-spacing: 1px; text-transform: uppercase; color: var(--text-muted); margin: 0 0 2px; }
+.sp-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--border-color); }
+.sp-name { flex: 1; }
+.sp-types { font-family: ui-monospace, monospace; font-size: 11px; color: var(--text-muted); flex: 1; }
+.sp-val { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-muted); min-width: 32px; text-align: center; }
+.sp-btn { background: var(--bg-base); border: 1px solid var(--border-color); color: var(--text-secondary); font-size: 11px; font-family: ui-monospace, monospace; cursor: pointer; padding: 3px 8px; border-radius: 3px; white-space: nowrap; }
+.sp-btn:hover { background: var(--border-color); color: var(--text-primary); }
+.sp-btn:disabled { opacity: 0.4; cursor: default; pointer-events: none; }
+.sp-btn.on { background: var(--bg-active); color: var(--text-strong); border-color: var(--border-subtle); }
+.sp-empty { color: var(--text-muted); font-family: ui-monospace, monospace; padding: 8px 0; }
 
 /* ── Line width slider – reliable downward triangle thumb (Chrome-first) ── */
 #line-width-slider {
@@ -587,15 +588,7 @@ header:fullscreen { display: none; }
         <div class="editor-area">
             <div id="tabs" class="hide-ext">
                 <div id="tab-settings-wrap">
-                    <button id="tab-settings-btn" title="Toggle settings">⛭</button>
-                    <div id="tab-settings-popover" class="hidden">
-                        <button class="settings-btn active" id="settings-toggle-slider" title="Toggle width slider">⇔</button>
-                        <button class="settings-btn active" id="settings-toggle-gutter" title="Toggle gutter">#</button>
-                        <button class="settings-btn" id="settings-toggle-ext" title="Toggle extension indicator">ext</button>
-                        <button class="settings-btn" id="settings-font-decrease" title="Decrease font size">A−</button>
-                        <button class="settings-btn" id="settings-font-reset" title="Reset font size" aria-label="Reset font size">ø</button>
-                        <button class="settings-btn" id="settings-font-increase" title="Increase font size">A+</button>
-                    </div>
+                    <button id="tab-settings-btn" title="Settings">⛭</button>
                 </div>
             </div>
             <div id="line-width-slider">
@@ -606,6 +599,7 @@ header:fullscreen { display: none; }
                 <button class="sidebar-toggle" id="sidebar-toggle" title="Toggle Sidebar">›</button>
                 <div id="gutter"></div>
                 <textarea id="textarea" spellcheck="false" autocapitalize="none" autocomplete="off"></textarea>
+                <div id="settings-panel" class="hidden"></div>
 			</div>
 			<div class="status">
 			  <span id="status"></span>
@@ -2205,7 +2199,8 @@ class TabManager {
         welcome: { canSave: false, canDirty: false },
         legend: { canSave: false, canDirty: false },
         text: { canSave: true, canDirty: true },
-        extension: { canSave: true, canDirty: true }
+        extension: { canSave: true, canDirty: true },
+        settings: { canSave: false, canDirty: false }
     };
     /** Returns true when a tab of the given type can be marked dirty/modified */
     static canTabBeDirty(type) { return TabManager.#TAB_TYPES[type]?.canDirty ?? false; }
@@ -2271,27 +2266,7 @@ class TabManager {
                 longPressTriggered = false;
                 longPressTimer = setTimeout(async () => {
                     longPressTriggered = true;
-                    if (!await new Promise(r => this.bus.emit('ui:dialog', {isConfirm: true, confirmMessage: `Uninstall extension "${ext.name}"?`, danger: true}, r))) return;
-                    await this.extensions.uninstall(ext.name);
-                    const currentTabId = this.state.currentTabId;
-                    let currentTabWasExtension = false;
-                    for (const t of this.state.tabs) {
-                        if (t.extension && t.extension.name === ext.name) {
-                            if (t.type === 'extension' && t.id === currentTabId) currentTabWasExtension = true;
-                            if (t._extTimers) { t._extTimers.forEach(c => clearTimeout(c)); t._extTimers = []; }
-                            if (t.extFrame) { t.extFrame.remove(); t.extFrame = null; }
-                            t.extension = null;
-                            if (t.type === 'extension') t.type = 'text';
-                            this.#replaceExtToggle(t);
-                        }
-                    }
-                    if (currentTabWasExtension) {
-                        const curTab = this.state.tabs.find(t => t.id === currentTabId);
-                        if (curTab) curTab._pendingTypeSwitch = true;
-                        this.switchToTab(currentTabId);
-                    } else {
-                        this.fs.saveOpenTabs(this.state.currentTabId);
-                    }
+                    await this.handleExtensionUninstall(ext.name);
                 }, 600);
             });
             extToggle.addEventListener('pointerup', () => clearTimeout(longPressTimer));
@@ -2446,7 +2421,14 @@ class TabManager {
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
         tab.element.classList.add('active');
         const gutterUserHidden = localStorage.getItem('gutterVisible') === 'false';
-        if (tab.type === 'extension') {
+        const settingsPanel = document.getElementById('settings-panel');
+        if (tab.type === 'settings') {
+            this.textarea.style.display = 'none';
+            if (!gutterUserHidden) this.gutter.style.display = 'none';
+            settingsPanel.classList.remove('hidden');
+            this.bus.emit('ui:settings-render');
+        } else if (tab.type === 'extension') {
+            settingsPanel.classList.add('hidden');
             if (tab.extension?.mode === 'split') {
                 // Split mode: show editor + extension side by side
                 this.textarea.style.display = '';
@@ -2462,6 +2444,7 @@ class TabManager {
                 this.extensions.renderTab(tab);
             }
         } else {
+            settingsPanel.classList.add('hidden');
             this.textarea.style.display = '';
             if (!gutterUserHidden) this.gutter.style.display = '';
             this.textarea.value = tab.content || '';
@@ -2552,6 +2535,7 @@ class TabManager {
         const tab = this.state.tabs[idx];
         if (tab.dirty && !await new Promise(r => this.bus.emit('ui:dialog', {isConfirm: true, confirmMessage: `"${tab.name}" has unsaved changes. Close anyway?`}, r))) return;
         if (tab.id === this.state.currentTabId) this.#exitSplitMode();
+        if (tab.type === 'settings') document.getElementById('settings-panel').classList.add('hidden');
         if (tab._extTimers) { tab._extTimers.forEach(c => clearTimeout(c)); tab._extTimers = []; }
         if (tab.extFrame) {
             tab.extFrame.remove();
@@ -2569,6 +2553,30 @@ class TabManager {
             return;
         }
         this.switchToTab(this.state.tabs[Math.min(idx, this.state.tabs.length - 1)].id);
+    }
+    /** Confirm-dialog + uninstall + cleanup all tabs that used this extension. */
+    async handleExtensionUninstall(name) {
+        if (!await new Promise(r => this.bus.emit('ui:dialog', { isConfirm: true, confirmMessage: `Uninstall extension "${name}"?`, danger: true }, r))) return;
+        await this.extensions.uninstall(name);
+        const currentTabId = this.state.currentTabId;
+        let currentTabWasExtension = false;
+        for (const t of this.state.tabs) {
+            if (t.extension && t.extension.name === name) {
+                if (t.type === 'extension' && t.id === currentTabId) currentTabWasExtension = true;
+                if (t._extTimers) { t._extTimers.forEach(c => clearTimeout(c)); t._extTimers = []; }
+                if (t.extFrame) { t.extFrame.remove(); t.extFrame = null; }
+                t.extension = null;
+                if (t.type === 'extension') t.type = 'text';
+                this.#replaceExtToggle(t);
+            }
+        }
+        if (currentTabWasExtension) {
+            const curTab = this.state.tabs.find(t => t.id === currentTabId);
+            if (curTab) curTab._pendingTypeSwitch = true;
+            this.switchToTab(currentTabId);
+        } else {
+            this.fs.saveOpenTabs(this.state.currentTabId);
+        }
     }
     async restoreOpenTabs(savedHandle, savedTabs = this.fs.loadOpenTabs()) {
         let restored = 0;
@@ -2897,6 +2905,7 @@ class UIManager {
         bus.on('ui:lines-update', force => this.updateLineNumbers(force));
         bus.on('ui:status-update', tab => this.updateEditorStatus(tab));
         bus.on('tree:highlight-active', () => this.tree.highlightActive());
+        bus.on('ui:settings-render', () => this.#renderSettingsPanel());
     }
     get contextMenuTarget() { return this.#contextMenuTarget; }
     get isMobile() { return this.#isMobile; }
@@ -2929,7 +2938,7 @@ class UIManager {
         const savedSidebarWidth = localStorage.getItem('sidebarWidth');
         if (savedSidebarWidth && !this.#sidebarEl.classList.contains('hidden')) this.#sidebarEl.style.width = savedSidebarWidth;
         this.bindEvents();
-        // Restore settings
+        // Restore settings state
         const savedFontSize = parseInt(localStorage.getItem('editorFontSize'));
         if (savedFontSize) {
             this.#textarea.style.fontSize = savedFontSize + 'px';
@@ -2937,15 +2946,12 @@ class UIManager {
         }
         if (localStorage.getItem('sliderVisible') === 'false') {
             document.getElementById('line-width-slider').classList.add('hidden');
-            document.getElementById('settings-toggle-slider').classList.remove('active');
         }
         if (localStorage.getItem('gutterVisible') === 'false') {
             this.#gutter.classList.add('hidden');
-            document.getElementById('settings-toggle-gutter').classList.remove('active');
         }
         if (localStorage.getItem('extToggleVisible') === 'true') {
             this.#tabsContainer.classList.remove('hide-ext');
-            document.getElementById('settings-toggle-ext').classList.add('active');
         }
         await this.fs.initDB();
         await this.extensions.loadAll();
@@ -3486,64 +3492,95 @@ class UIManager {
         slider.dispatchEvent(new Event('input'));
     }
     #bindSettingsPopover() {
-        const settingsBtn = document.getElementById('tab-settings-btn');
-        const popover = document.getElementById('tab-settings-popover');
-        const positionPopover = () => {
-            if (popover.classList.contains('hidden')) return;
-            const rect = settingsBtn.getBoundingClientRect();
-            popover.style.top = rect.bottom + 'px';
-            popover.style.left = rect.left + 'px';
-        };
-        settingsBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            popover.classList.toggle('hidden');
-            positionPopover();
+        document.getElementById('tab-settings-btn').addEventListener('click', () => {
+            const existing = this.state.tabs.find(t => t.type === 'settings');
+            if (existing) { this.tabs.switchToTab(existing.id); return; }
+            this.tabs.createNewTab(null, 'SETTINGS', '', null, 'settings');
         });
-        window.addEventListener('resize', positionPopover);
-        // Close popover when clicking outside
-        document.addEventListener('click', (e) => {
-            if (!popover.contains(e.target) && !settingsBtn.contains(e.target)) {
-                popover.classList.add('hidden');
+    }
+    #applyFontSize(sz) {
+        this.#textarea.style.fontSize = sz + 'px';
+        this.#gutter.style.fontSize = sz + 'px';
+        localStorage.setItem('editorFontSize', sz);
+    }
+    #renderSettingsPanel() {
+        const panel = document.getElementById('settings-panel');
+        if (!panel || panel.classList.contains('hidden')) return;
+        const MIN_FONT = 10, MAX_FONT = 24, DEFAULT_FONT_SIZE = 14;
+        const fontSize = parseInt(this.#textarea.style.fontSize) || DEFAULT_FONT_SIZE;
+        const sliderOn = localStorage.getItem('sliderVisible') !== 'false';
+        const gutterOn = localStorage.getItem('gutterVisible') !== 'false';
+        const extOn = localStorage.getItem('extToggleVisible') === 'true';
+        const exts = this.extensions.extensions;
+        const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        panel.innerHTML = `<div class="sp-section">
+  <div class="sp-label">Format</div>
+  <div class="sp-row">
+    <span class="sp-name">Font size</span>
+    <button class="sp-btn" data-act="font-dec"${fontSize <= MIN_FONT ? ' disabled' : ''}>A−</button>
+    <span class="sp-val">${fontSize}px</span>
+    <button class="sp-btn" data-act="font-inc"${fontSize >= MAX_FONT ? ' disabled' : ''}>A+</button>
+    <button class="sp-btn" data-act="font-reset">reset</button>
+  </div>
+  <div class="sp-row">
+    <span class="sp-name">Ruler</span>
+    <button class="sp-btn${sliderOn ? ' on' : ''}" data-act="toggle-slider">${sliderOn ? 'on' : 'off'}</button>
+  </div>
+  <div class="sp-row">
+    <span class="sp-name">Line numbers</span>
+    <button class="sp-btn${gutterOn ? ' on' : ''}" data-act="toggle-gutter">${gutterOn ? 'on' : 'off'}</button>
+  </div>
+</div>
+<div class="sp-section">
+  <div class="sp-label">Extensions</div>
+  ${exts.length === 0
+    ? '<div class="sp-empty">no extensions installed</div>'
+    : exts.map(e => `<div class="sp-row">
+    <span class="sp-name">${esc(e.name)}</span>
+    <span class="sp-types">${esc(e.types.join(', '))}</span>
+    <button class="sp-btn" data-act="uninstall" data-ext="${esc(e.name)}">remove</button>
+  </div>`).join('')}
+  <div class="sp-row" style="border-top:none; padding-top:8px;">
+    <button class="sp-btn" data-act="install-ext">+ install</button>
+    <button class="sp-btn${extOn ? ' on' : ''}" data-act="toggle-ext" style="margin-left:auto">badges ${extOn ? 'on' : 'off'}</button>
+  </div>
+</div>`;
+        panel.onclick = async ev => {
+            const btn = ev.target.closest('[data-act]');
+            if (!btn) return;
+            const act = btn.dataset.act;
+            if (act === 'font-dec') {
+                const cur = parseInt(this.#textarea.style.fontSize) || DEFAULT_FONT_SIZE;
+                if (cur > MIN_FONT) { this.#applyFontSize(cur - 1); this.#renderSettingsPanel(); }
+            } else if (act === 'font-inc') {
+                const cur = parseInt(this.#textarea.style.fontSize) || DEFAULT_FONT_SIZE;
+                if (cur < MAX_FONT) { this.#applyFontSize(cur + 1); this.#renderSettingsPanel(); }
+            } else if (act === 'font-reset') {
+                this.#applyFontSize(DEFAULT_FONT_SIZE); this.#renderSettingsPanel();
+            } else if (act === 'toggle-slider') {
+                const nowHidden = document.getElementById('line-width-slider').classList.toggle('hidden');
+                localStorage.setItem('sliderVisible', !nowHidden);
+                this.#renderSettingsPanel();
+            } else if (act === 'toggle-gutter') {
+                const nowHidden = this.#gutter.classList.toggle('hidden');
+                localStorage.setItem('gutterVisible', !nowHidden);
+                this.#renderSettingsPanel();
+            } else if (act === 'toggle-ext') {
+                const nowHidden = this.#tabsContainer.classList.toggle('hide-ext');
+                localStorage.setItem('extToggleVisible', !nowHidden);
+                this.#renderSettingsPanel();
+            } else if (act === 'uninstall') {
+                await this.tabs.handleExtensionUninstall(btn.dataset.ext);
+                this.#renderSettingsPanel();
+            } else if (act === 'install-ext') {
+                await this.extensions.install();
+                this.tabs.reattachExtensions();
+                this.#renderSettingsPanel();
             }
-        });
+        };
     }
     bindSettings() {
         this.#bindSettingsPopover();
-        // Toggle width slider
-        document.getElementById('settings-toggle-slider').addEventListener('click', e => {
-            const sliderEl = document.getElementById('line-width-slider');
-            const nowHidden = sliderEl.classList.toggle('hidden');
-            e.currentTarget.classList.toggle('active', !nowHidden);
-            localStorage.setItem('sliderVisible', !nowHidden);
-        });
-        // Toggle gutter
-        document.getElementById('settings-toggle-gutter').addEventListener('click', () => {
-            const nowHidden = this.#gutter.classList.toggle('hidden');
-            document.getElementById('settings-toggle-gutter').classList.toggle('active', !nowHidden);
-            localStorage.setItem('gutterVisible', !nowHidden);
-        });
-        // Toggle ext-toggle visibility
-        document.getElementById('settings-toggle-ext').addEventListener('click', e => {
-            const nowHidden = this.#tabsContainer.classList.toggle('hide-ext');
-            e.currentTarget.classList.toggle('active', !nowHidden);
-            localStorage.setItem('extToggleVisible', !nowHidden);
-        });
-        // Font size
-        const MIN_FONT = 10, MAX_FONT = 24, DEFAULT_FONT_SIZE = 14;
-        const applyFontSize = sz => {
-            this.#textarea.style.fontSize = sz + 'px';
-            this.#gutter.style.fontSize = sz + 'px';
-            localStorage.setItem('editorFontSize', sz);
-        };
-        document.getElementById('settings-font-decrease').addEventListener('click', () => {
-            const cur = parseInt(this.#textarea.style.fontSize) || DEFAULT_FONT_SIZE;
-            if (cur > MIN_FONT) applyFontSize(cur - 1);
-        });
-        document.getElementById('settings-font-increase').addEventListener('click', () => {
-            const cur = parseInt(this.#textarea.style.fontSize) || DEFAULT_FONT_SIZE;
-            if (cur < MAX_FONT) applyFontSize(cur + 1);
-        });
-        document.getElementById('settings-font-reset').addEventListener('click', () => applyFontSize(DEFAULT_FONT_SIZE));
     }
  
 bindEvents() {
