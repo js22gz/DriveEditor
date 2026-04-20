@@ -1453,7 +1453,7 @@ class FileManager {
         try {
             const data = this.state.tabs
                 .filter(t => t.path)
-                .map(t => ({ path: t.path, name: t.name, type: t.type, active: t.id === currentId, storageId: t.handle?.id }));
+                .map(t => ({ path: t.path, name: t.name, type: t.type, active: t.id === currentId, storageId: t.handle?.id, extensionName: t.extension?.name || null }));
             // Only persist when there are real file tabs.  When the list is empty
             // (e.g. only the welcome tab is open) we deliberately do NOT overwrite
             // localStorage — this preserves previously saved tab data so it can be
@@ -2101,6 +2101,9 @@ class ExtensionManager {
         }
         return null;
     }
+    getByName(name) {
+        return this.extensions.find(e => e.name === name) || null;
+    }
     renderTab(tab) {
         // Cancel stale fallback timers from a previous render
         if (tab._extTimers) tab._extTimers.forEach(t => clearTimeout(t));
@@ -2238,12 +2241,11 @@ class TabManager {
             extToggle.onclick = async e => {
                 e.stopPropagation();
                 await this.extensions.install();
+                // Re-attach extensions to all open tabs that match the newly installed extension
+                this.reattachExtensions();
                 const newExt = this.extensions.getForFile(tab.name);
                 if (newExt) {
-                    tab.extension = newExt;
                     if (this.state.currentTabId === tab.id) tab.content = this.textarea.value;
-                    tab.type = 'extension';
-                    this.#replaceExtToggle(tab);
                     tab._pendingTypeSwitch = true;
                     this.switchToTab(tab.id);
                 }
@@ -2525,6 +2527,18 @@ class TabManager {
                 const file = await fileHandle.getFile();
                 const content = await file.text();
                 await this.createNewTab(fileHandle, st.name, content, st.path, st.type || 'text');
+                // Re-attach extension if getForFile missed it during #createTab
+                if (st.extensionName) {
+                    const restoredTab = this.state.tabs.find(t => t.path === st.path);
+                    if (restoredTab && !restoredTab.extension) {
+                        const ext = this.extensions.getByName(st.extensionName);
+                        if (ext) {
+                            restoredTab.extension = ext;
+                            restoredTab.type = 'extension';
+                            this.#replaceExtToggle(restoredTab);
+                        }
+                    }
+                }
                 if (st.active) activeTabPath = st.path;
                 restored++;
             } catch (e) {
@@ -2538,6 +2552,18 @@ class TabManager {
             this.switchToTab(this.state.tabs[0].id);
         }
         return restored;
+    }
+    /** Re-scan all open tabs and re-attach any matching extensions from ExtensionManager. */
+    reattachExtensions() {
+        for (const tab of this.state.tabs) {
+            if (tab.type !== 'text' && tab.type !== 'extension') continue;
+            const ext = this.extensions.getForFile(tab.name);
+            if (ext && (!tab.extension || tab.extension.name !== ext.name)) {
+                tab.extension = ext;
+                if (tab.type !== 'extension') tab.type = 'extension';
+                this.#replaceExtToggle(tab);
+            }
+        }
     }
 }
 // ────────────────────────────────────────────────────────
@@ -2557,13 +2583,15 @@ class SessionRestoreManager {
     #tabs;
     #tree;
     #ui;
-    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {DirectoryTreeView} tree @param {UIManager} ui */
-    constructor(state, fs, tabs, tree, ui) {
+    #extensions;
+    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {DirectoryTreeView} tree @param {UIManager} ui @param {ExtensionManager} extensions */
+    constructor(state, fs, tabs, tree, ui, extensions) {
         this.#state = state;
         this.#fs = fs;
         this.#tabs = tabs;
         this.#tree = tree;
         this.#ui = ui;
+        this.#extensions = extensions;
     }
     /** Allow mutable fs reference when backend switches */
     set fs(v) { this.#fs = v; }
@@ -2671,6 +2699,8 @@ class SessionRestoreManager {
     async #wakeRebuild() {
         await this.#fs.mutateAndRebuild();
         this.#tree.highlightActive();
+        // Re-attach extensions to any tabs that lost their association
+        this.#tabs.reattachExtensions();
         // If tabs disappeared (page discarded mid-session), restore from localStorage
         if (!this.#state.tabs.length && this.#state.currentDirHandle) {
             const restored = await this.#tabs.restoreOpenTabs(this.#state.currentDirHandle);
@@ -2702,6 +2732,8 @@ class SessionRestoreManager {
         try {
             // Ensure IndexedDB connection is still alive after sleep
             await IndexedDBHelper.ensureOpen();
+            // Re-load extensions so stale handles are refreshed
+            await this.#extensions.loadAll();
             const permOk = await this.#revalidatePermission();
             if (permOk && this.#state.currentDirHandle) {
                 // Small settle delay — some platforms need a moment after wake
@@ -3432,6 +3464,7 @@ class UIManager {
         });
         document.getElementById('settings-font-reset').addEventListener('click', () => applyFontSize(DEFAULT_FONT_SIZE));
     }
+ 
 bindEvents() {
     this.bindKeyboard();
     this.bindTreeEvents();
@@ -3482,7 +3515,7 @@ class EditorApp {
         this.extensions = new ExtensionManager(this.state, this.fs);
         this.tabs = new TabManager(this.state, this.fs, this.extensions);
         this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions);
-        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.tree, this.ui);
+        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.tree, this.ui, this.extensions);
         this.ui.restore = this.restore;
         this.#wireBackend(this.fs);
         this.#updateBackendBtn();
