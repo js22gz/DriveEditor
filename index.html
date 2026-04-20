@@ -693,6 +693,33 @@ class ReactiveState extends EventTarget {
 // ────────────────────────────────────────────────────────
 // PathUtils – file-path helpers
 // ────────────────────────────────────────────────────────
+class FileTypeUtils {
+    // Known binary / non-text extensions
+    static #BIN = new Set([
+        'png','jpg','jpeg','gif','bmp','ico','webp','tiff','tif','svg','psd','ai','eps',
+        'mp3','wav','ogg','flac','aac','wma','m4a','opus',
+        'mp4','avi','mov','mkv','wmv','flv','webm','m4v','3gp',
+        'zip','gz','tar','rar','7z','bz2','xz','zst','iso','dmg',
+        'pdf','doc','docx','xls','xlsx','ppt','pptx','odt','ods','odp',
+        'exe','dll','so','dylib','bin','msi','deb','rpm','apk','app',
+        'ttf','otf','woff','woff2','eot',
+        'sqlite','db','mdb',
+        'class','pyc','o','obj','a','lib','war','jar','ear',
+        'DS_Store',
+    ]);
+    static isNonText(name) {
+        const dot = name.lastIndexOf('.');
+        return dot > 0 && this.#BIN.has(name.slice(dot + 1).toLowerCase());
+    }
+    static copyName(name) {
+        const dot = name.lastIndexOf('.');
+        const base = dot > 0 ? name.slice(0, dot) : name;
+        const ext = dot > 0 ? name.slice(dot) : '';
+        const m = base.match(/^(.*)\((\d+)\)$/);
+        if (m) return `${m[1]}(${+m[2] + 1})${ext}`;
+        return `${base}(1)${ext}`;
+    }
+}
 class PathUtils {
     /**
      * Resolves a path relative to a base directory handle.
@@ -980,14 +1007,14 @@ class StorageAdapter {
             await this.#moveFileImpl(srcNode, srcParent, destNode.handle);
         }
     }
-    async copyEntryImpl(srcNode, destNode) {
+    async copyEntryImpl(srcNode, destNode, copyName = srcNode.name) {
         await this.#guard(destNode.handle);
         if (srcNode.kind === 'file') {
             const file = await srcNode.handle.getFile();
-            const newHandle = await destNode.handle.getFileHandle(srcNode.name, { create: true });
+            const newHandle = await destNode.handle.getFileHandle(copyName, { create: true });
             await this.#write(newHandle, file);
         } else {
-            await this.#copyDirImpl(srcNode.handle, destNode.handle, srcNode.name);
+            await this.#copyDirImpl(srcNode.handle, destNode.handle, copyName);
         }
     }
     async isSameEntry(h1, h2) { return !!h1 && !!h2 && h1.isSameEntry(h2); }
@@ -1344,15 +1371,15 @@ class DriveAdapter extends StorageAdapter {
         );
         if (!resp.ok) throw new Error(`Move failed: ${resp.status}`);
     }
-    async copyEntryImpl(srcNode, destNode) {
+    async copyEntryImpl(srcNode, destNode, copyName = srcNode.name) {
         if (srcNode.kind === 'file') {
             const resp = await this.#api.dr(`${DriveAdapter.DRIVE_API}/files/${srcNode.handle.id}/copy`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: srcNode.name, parents: [destNode.handle.id] }),
+                body: JSON.stringify({ name: copyName, parents: [destNode.handle.id] }),
             });
             if (!resp.ok) throw new Error(`Copy failed: ${resp.status}`);
         } else {
-            await this.#api.copyDirectory(srcNode.handle.id, destNode.handle.id, srcNode.name);
+            await this.#api.copyDirectory(srcNode.handle.id, destNode.handle.id, copyName);
         }
     }
     async isSameEntry(h1, h2) { return !!h1 && !!h2 && h1.id === h2.id; }
@@ -1592,6 +1619,7 @@ class FileManager {
             const result = await this.adapter.pickFile();
             if (!result) return;
             const { handle, name, content, size } = result;
+            if (FileTypeUtils.isNonText(name)) return this.bus.emit('ui:toast', 'Not a text file. This is a text editor', 3000);
             if (!await this.#confirmLargeFile(size)) return;
             for (const t of this.state.tabs) {
                 if (t.handle && await this.isSameEntry(t.handle, handle)) {
@@ -1605,6 +1633,7 @@ class FileManager {
         }
     }
     async openFileFromNode(node) {
+        if (FileTypeUtils.isNonText(node.name)) return this.bus.emit('ui:toast', 'Not a text file. This is a text editor', 3000);
         try {
             const size = await this.adapter.getNodeSize(node);
             if (!await this.#confirmLargeFile(size)) return;
@@ -1824,10 +1853,11 @@ class FileManager {
         const destNode = this.tree.getNode(destFolderPath || '/');
         if (!destNode) return this.bus.emit('ui:toast', 'Destination folder not found');
         try {
-            if (await this.adapter.existsInDir(destNode, srcNode.name)) {
-                return this.bus.emit('ui:toast', `"${srcNode.name}" already exists in destination`);
+            let copyName = srcNode.name;
+            while (await this.adapter.existsInDir(destNode, copyName)) {
+                copyName = FileTypeUtils.copyName(copyName);
             }
-            await this.adapter.copyEntryImpl(srcNode, destNode);
+            await this.adapter.copyEntryImpl(srcNode, destNode, copyName);
             if (destFolderPath) {
                 this.state.expandedFolders.add(destFolderPath);
                 this.saveExpandedState();
@@ -1835,7 +1865,7 @@ class FileManager {
             await this.mutateAndRebuild();
             // Notify tab-related listeners of possible path changes
             this.state.notify('tabs');
-            this.bus.emit('ui:toast', `Copied "${srcNode.name}"`);
+            this.bus.emit('ui:toast', `Copied "${copyName}"`);
         } catch (e) {
             this.bus.emit('ui:toast', this.adapter.formatError('Copy', e), 4000);
         }
