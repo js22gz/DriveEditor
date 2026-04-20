@@ -378,6 +378,7 @@ header:fullscreen { display: none; }
 .sp-val { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-muted); min-width: 32px; text-align: center; }
 .sp-btn { background: var(--bg-base); border: 1px solid var(--border-color); color: var(--text-secondary); font-size: 11px; font-family: ui-monospace, monospace; cursor: pointer; padding: 3px 8px; border-radius: 3px; white-space: nowrap; }
 .sp-btn:hover { background: var(--border-color); color: var(--text-primary); }
+.sp-btn:disabled { opacity: 0.4; cursor: default; pointer-events: none; }
 .sp-btn.on { background: var(--bg-active); color: var(--text-strong); border-color: var(--border-subtle); }
 .sp-empty { color: var(--text-muted); font-family: ui-monospace, monospace; padding: 8px 0; }
 
@@ -3511,6 +3512,7 @@ class UIManager {
         const gutterOn = localStorage.getItem('gutterVisible') !== 'false';
         const extOn = localStorage.getItem('extToggleVisible') === 'true';
         const exts = this.extensions.extensions;
+        const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         panel.innerHTML = `<div class="sp-section">
   <div class="sp-label">Format</div>
   <div class="sp-row">
@@ -3534,9 +3536,9 @@ class UIManager {
   ${exts.length === 0
     ? '<div class="sp-empty">no extensions installed</div>'
     : exts.map(e => `<div class="sp-row">
-    <span class="sp-name">${e.name}</span>
-    <span class="sp-types">${e.types.join(', ')}</span>
-    <button class="sp-btn" data-act="uninstall" data-ext="${e.name}">remove</button>
+    <span class="sp-name">${esc(e.name)}</span>
+    <span class="sp-types">${esc(e.types.join(', '))}</span>
+    <button class="sp-btn" data-act="uninstall" data-ext="${esc(e.name)}">remove</button>
   </div>`).join('')}
   <div class="sp-row" style="border-top:none; padding-top:8px;">
     <button class="sp-btn" data-act="install-ext">+ install</button>
