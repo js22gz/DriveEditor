@@ -635,11 +635,14 @@ class EventBus {
     }
     off(event, fn) {
         const list = this.#listeners[event];
-        if (list) this.#listeners[event] = list.filter(f => f !== fn);
+        if (!list) return;
+        const filtered = list.filter(f => f !== fn);
+        if (filtered.length) this.#listeners[event] = filtered;
+        else delete this.#listeners[event];
     }
     emit(event, ...args) {
         const list = this.#listeners[event];
-        if (list) for (const fn of list) fn(...args);
+        if (list) for (const fn of list.slice()) fn(...args);
     }
 }
 // ────────────────────────────────────────────────────────
