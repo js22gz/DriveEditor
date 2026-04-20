@@ -1367,7 +1367,6 @@ class FileManager {
     #saveInProgress = false;
     #restoring = false;
     #restoreStartedAt = 0;
-    #ui = null;
     /** @param {ReactiveState} state @param {StorageAdapter} adapter @param {EventBus} bus */
     constructor(state, adapter, bus) {
         this.state = state;
@@ -1390,9 +1389,6 @@ class FileManager {
     }
     // Proxy db to adapter (used by ExtensionManager)
     get db() { return this.adapter.db; }
-    // ui is still needed for dialogs, textarea access, and contextMenuTarget
-    get ui() { return this.#ui; }
-    set ui(v) { this.#ui = v; }
     // ── DB & persistence ──────────────────────────────────
     async initDB() { return this.adapter.initDB(); }
     async queryPermission(handle) { return this.adapter.queryPermission(handle); }
@@ -1569,11 +1565,10 @@ class FileManager {
     async #confirmLargeFile(size) {
         if (size <= this.#MAX_FILE_SIZE) return true;
         const sizeMB = (size / (1024 * 1024)).toFixed(1);
-        return this.#ui.showDialog({
-            isConfirm: true,
+        return new Promise(r => this.bus.emit('ui:confirm', {
             confirmMessage: `This file is ${sizeMB} MB. Files over 3 MB may slow down or break the app. Open anyway?`,
             danger: true
-        });
+        }, r));
     }
     async openFolder() {
         try {
@@ -1615,8 +1610,8 @@ class FileManager {
             if (!await this.#confirmLargeFile(size)) return;
             const content = await this.adapter.readNode(node);
             await this.tabs.createNewTab(node.handle, node.name, content, node.path);
-            if (this.#ui.isMobile && !this.#ui.sidebarEl.classList.contains('hidden')) {
-                this.#ui.toggleSidebar();
+            if (window.innerWidth <= 768 && !document.getElementById('sidebar').classList.contains('hidden')) {
+                this.bus.emit('ui:toggle-sidebar');
             }
         } catch (e) {
             this.bus.emit('ui:toast', this.adapter.getReadErrorMsg(e));
@@ -1629,10 +1624,11 @@ class FileManager {
             this.bus.emit('ui:toast', 'Failed to open file in browser');
         }
     }
+    #getContextTarget() { let t; this.bus.emit('ui:get-context-target', v => t = v); return t; }
     // ── Target directory ──────────────────────────────────
     async #getTargetDir() {
         return this.adapter.resolveTargetDir(
-            this.#ui.contextMenuTarget,
+            this.#getContextTarget(),
             this.state.activeDirectoryPaths[this.state.lastActivePane],
             this.state.currentDirHandle,
             path => this.tree.getNode(path)
@@ -1662,7 +1658,7 @@ class FileManager {
         const activePath = this.state.activeDirectoryPaths[this.state.lastActivePane] || '';
         const rootName = this.state.currentDirHandle.name;
         const displayPath = '/' + rootName + (activePath ? '/' + activePath : '') + '/';
-        const name = await this.#ui.showDialog({ promptTitle: isFile ? 'New file name:' : 'New folder name:', subtitle: displayPath });
+        const name = await new Promise(r => this.bus.emit('ui:prompt', { promptTitle: isFile ? 'New file name:' : 'New folder name:', subtitle: displayPath }, r));
         if (!name?.trim()) return;
         const trimmed = name.trim();
         if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
@@ -1675,7 +1671,7 @@ class FileManager {
     async newFolder() { return this.#newItem('folder'); }
     async createFromDialog() {
         if (!this.state.currentDirHandle) return this.bus.emit('ui:toast', this.adapter.notConnectedMsg);
-        const result = await this.#ui.showCreateDialog();
+        const result = await new Promise(r => this.bus.emit('ui:create-dialog', r));
         if (!result) return;
         const { kind, name: trimmed } = result;
         if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed))
@@ -1704,7 +1700,7 @@ class FileManager {
         if (!tab?.handle || !tab.dirty) return;
         try {
             const content = (this.state.currentTabId === tab.id && (tab.type !== 'extension' || tab.extension?.mode === 'split'))
-                ? this.#ui.textarea.value
+                ? document.getElementById('textarea').value
                 : tab.content;
             await this.adapter.writeFile(tab.handle, content);
             tab.content = content;
@@ -1730,9 +1726,9 @@ class FileManager {
     }
     // ── Delete ────────────────────────────────────────────
     async deleteFile() {
-        const target = this.#ui.contextMenuTarget;
+        const target = this.#getContextTarget();
         if (!target || target.kind !== 'file') return;
-        if (!await this.#ui.showDialog({ isConfirm: true, confirmMessage: `Delete "${target.name}"?`, danger: true })) {
+        if (!await new Promise(r => this.bus.emit('ui:confirm', { confirmMessage: `Delete "${target.name}"?`, danger: true }, r))) {
             this.bus.emit('ui:context-menu-close'); return;
         }
         try {
@@ -1751,12 +1747,12 @@ class FileManager {
         this.bus.emit('ui:context-menu-close');
     }
     async deleteFolder() {
-        const target = this.#ui.contextMenuTarget;
+        const target = this.#getContextTarget();
         if (!target || target.kind !== 'directory') return;
         const isNonEmpty = target.children?.length > 0;
         const confirmed = isNonEmpty
-            ? (await this.#ui.showDialog({ promptTitle: `Type "remove" to delete non-empty folder "${target.name}":` }) || '').trim().toLowerCase() === 'remove'
-            : await this.#ui.showDialog({ isConfirm: true, confirmMessage: `Delete folder "${target.name}"?`, danger: true });
+            ? (await new Promise(r => this.bus.emit('ui:prompt', { promptTitle: `Type "remove" to delete non-empty folder "${target.name}":` }, r)) || '').trim().toLowerCase() === 'remove'
+            : await new Promise(r => this.bus.emit('ui:confirm', { confirmMessage: `Delete folder "${target.name}"?`, danger: true }, r));
         if (!confirmed) { this.bus.emit('ui:context-menu-close'); return; }
         try {
             await this.adapter.deleteFolderEntry(target, this.state.currentDirHandle);
@@ -1771,12 +1767,12 @@ class FileManager {
     }
     // ── Rename ────────────────────────────────────────────
     async renameItem() {
-        const target = this.#ui.contextMenuTarget;
+        const target = this.#getContextTarget();
         if (!target) return;
-        const newName = await this.#ui.showDialog({
+        const newName = await new Promise(r => this.bus.emit('ui:prompt', {
             promptTitle: `Rename ${target.kind}:`,
             defaultValue: target.name
-        });
+        }, r));
         if (!newName?.trim() || newName === target.name) { this.bus.emit('ui:context-menu-close'); return; }
         const trimmed = newName.trim();
         if (this.#INVALID_CHARS.test(trimmed) || /[\/\\]/.test(trimmed)) {
@@ -2619,15 +2615,12 @@ class SessionRestoreManager {
     #state;
     #fs;
     #tabs;
-    #ui;
     #extensions;
-    #bus;
-    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {UIManager} ui @param {ExtensionManager} extensions @param {EventBus} bus */
-    constructor(state, fs, tabs, ui, extensions, bus) {
+    /** @param {ReactiveState} state @param {FileManager} fs @param {TabManager} tabs @param {ExtensionManager} extensions @param {EventBus} bus */
+    constructor(state, fs, tabs, extensions, bus) {
         this.#state = state;
         this.#fs = fs;
         this.#tabs = tabs;
-        this.#ui = ui;
         this.#extensions = extensions;
         this.bus = bus;
     }
@@ -2692,7 +2685,7 @@ class SessionRestoreManager {
     // ── Capture in-memory state to localStorage ──────────
     #snapshotState() {
         const activeTab = this.#state.getActiveTab();
-        const textarea = this.#ui.textarea;
+        const textarea = document.getElementById('textarea');
         if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && textarea) {
             activeTab.content = textarea.value;
             activeTab.scrollTop = textarea.scrollTop;
@@ -2750,7 +2743,7 @@ class SessionRestoreManager {
         }
         // Refresh active non-dirty tab content from disk
         const activeTab = this.#state.getActiveTab();
-        const textarea = this.#ui.textarea;
+        const textarea = document.getElementById('textarea');
         if (activeTab?.handle && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && !activeTab.dirty) {
             try {
                 const file = await activeTab.handle.getFile();
@@ -2781,7 +2774,7 @@ class SessionRestoreManager {
             }
             // Verify visual state — ensure textarea shows active tab content
             const activeTab = this.#state.getActiveTab();
-            const textarea = this.#ui.textarea;
+            const textarea = document.getElementById('textarea');
             if (activeTab && (activeTab.type !== 'extension' || activeTab.extension?.mode === 'split') && textarea) {
                 if (textarea.value !== (activeTab.content || '')) {
                     textarea.value = activeTab.content || '';
@@ -2861,8 +2854,13 @@ class UIManager {
         this.bus = bus;
         this.#isMobile = window.innerWidth <= 768;
         /** @type {SessionRestoreManager} */ this.restore = null;
-        // Subscribe to bus events – centralizes all fire-and-forget UI updates
+        // Subscribe to bus events – centralizes all UI updates & dialogs
         bus.on('ui:dialog', (opts, resolve) => this.showDialog(opts).then(resolve));
+        bus.on('ui:confirm', (opts, resolve) => this.showDialog({isConfirm: true, ...opts}).then(resolve));
+        bus.on('ui:prompt', (opts, resolve) => this.showDialog(opts).then(resolve));
+        bus.on('ui:create-dialog', resolve => this.showCreateDialog().then(resolve));
+        bus.on('ui:toggle-sidebar', () => this.toggleSidebar());
+        bus.on('ui:get-context-target', resolve => resolve(this.#contextMenuTarget));
         bus.on('ui:toast', (msg, dur) => this.showToast(msg, dur));
         bus.on('ui:action-toast', (msg, cb, dur) => this.showActionToast(msg, cb, dur));
         bus.on('ui:context-menu-close', () => this.closeContextMenu());
@@ -3569,7 +3567,7 @@ class EditorApp {
         this.extensions = new ExtensionManager(this.state, this.fs, this.bus);
         this.tabs = new TabManager(this.state, this.fs, this.extensions, this.bus);
         this.ui = new UIManager(this.state, this.tabs, this.tree, this.fs, this.extensions, this.bus);
-        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.ui, this.extensions, this.bus);
+        this.restore = new SessionRestoreManager(this.state, this.fs, this.tabs, this.extensions, this.bus);
         this.ui.restore = this.restore;
         this.#wireBackend(this.fs);
         this.#updateBackendBtn();
@@ -3577,7 +3575,6 @@ class EditorApp {
     #wireBackend(fs) {
         fs.tree = this.tree;
         fs.tabs = this.tabs;
-        fs.ui = this.ui;
     }
     #setBackend(fs) {
         this.fs = fs;
